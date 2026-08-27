@@ -13,8 +13,10 @@
             [scriptum.metadata :as metadata])
   (:import [java.nio.file Path Paths]
            [java.time Instant Duration]
+           [java.util.function UnaryOperator]
            [org.apache.lucene.analysis Analyzer]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
+           [org.apache.lucene.codecs Codec]
            [org.apache.lucene.document Document Field$Store TextField StringField
             IntField LongField FloatField DoubleField StoredField
             KnnFloatVectorField]
@@ -74,6 +76,39 @@
   (when ram-buffer-mb (.setRAMBufferSizeMB writer (double ram-buffer-mb)))
   writer)
 
+(defn- ->iwc-customizer
+  "The IndexWriterConfig customizer for the `:codec` / `:iwc-fn` options, or nil.
+
+  THE ONLY REACH INTO THE SETTINGS THAT ARE NOT LIVE. `tune!` applies the size
+  knobs after construction because Lucene re-reads those; a codec is fixed when
+  the IndexWriter is built, and `getConfig` afterwards hands back a
+  LiveIndexWriterConfig where it is read-only. So it has to go in before, which
+  is why it is an option here and not a setter.
+
+  That is what a `SuggestField` needs: a codec whose `getPostingsFormatForField`
+  answers with a `CompletionPostingsFormat`. scriptum does not depend on
+  lucene-suggest and names no completion format itself — the caller brings the
+  codec.
+
+  `:iwc-fn` is the general form. It is handed the config scriptum has already
+  configured and must MUTATE and return that same object; returning a fresh
+  IndexWriterConfig would drop the deletion and merge policies branching depends
+  on, and the writer throws rather than quietly losing history or sharing.
+
+  NOT REMEMBERED BY THE INDEX. Nothing about the customizer is recorded on disk,
+  so a branch created with a codec and reopened without one writes its new
+  segments in the default format. `fork` carries it; `open-branch` and
+  `open-store-index` have to be told again."
+  ^UnaryOperator [codec iwc-fn]
+  (when (and codec iwc-fn)
+    (throw (ex-info "scriptum: pass :codec or :iwc-fn, not both"
+                    {:codec codec :iwc-fn iwc-fn})))
+  (cond
+    codec (BranchIndexWriter/withCodec ^Codec codec)
+    iwc-fn (reify UnaryOperator
+             (apply [_ config] (iwc-fn config)))
+    :else nil))
+
 (defn create-index
   "Create a new branched index at the given path.
 
@@ -84,6 +119,8 @@
     :crypto-hash? - enable merkle hashing for commits (default: false)
     :max-merged-segment-mb - cap on a merged segment, in MB (Lucene default: 5120)
     :ram-buffer-mb - flush buffer, in MB (Lucene default: 16)
+    :codec - a Lucene Codec for segments this writer creates (default: Lucene's)
+    :iwc-fn - fn of IndexWriterConfig, applied before the IndexWriter is built
 
   THE TWO SIZE KNOBS ARE THE ONES THAT MATTER FOR A REMOTE STORE. Lucene's
   defaults are tuned for a local disk, where a segment is just a file and 5 GB
@@ -97,15 +134,20 @@
   created by a flush, before any merge, and so governs how small the small
   objects are.
 
+  `:codec` is what makes Lucene's suggest fields usable here — see
+  `->iwc-customizer`. It carries to `fork`, but not across a reopen.
+
   Returns a ScriptumWriter wrapping BranchIndexWriter + metadata index."
   ([^String path ^String branch-name]
    (create-index path branch-name {}))
   ([^String path ^String branch-name {:keys [analyzer crypto-hash?
-                                             max-merged-segment-mb ram-buffer-mb]}]
+                                             max-merged-segment-mb ram-buffer-mb
+                                             codec iwc-fn]}]
    (let [base-path (->path path)
          analyzer (or analyzer (StandardAnalyzer.))
          crypto-hash (boolean crypto-hash?)
-         writer (BranchIndexWriter/create base-path branch-name analyzer crypto-hash)
+         writer (BranchIndexWriter/create base-path branch-name analyzer crypto-hash
+                                          (->iwc-customizer codec iwc-fn))
          mi (metadata/create-metadata-index path)]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer mi nil))))
@@ -120,6 +162,8 @@
     :metadata-index - shared metadata index (default: creates new one)
     :max-merged-segment-mb - cap on a merged segment, in MB (Lucene default: 5120)
     :ram-buffer-mb - flush buffer, in MB (Lucene default: 16)
+    :codec - a Lucene Codec for segments this writer creates (default: Lucene's)
+    :iwc-fn - fn of IndexWriterConfig, applied before the IndexWriter is built
 
   THE TWO SIZE KNOBS ARE THE ONES THAT MATTER FOR A REMOTE STORE. Lucene's
   defaults are tuned for a local disk, where a segment is just a file and 5 GB
@@ -131,14 +175,20 @@
 
   The flush buffer sets the other end of the distribution: it bounds segments
   created by a flush, before any merge, and so governs how small the small
-  objects are."
+  objects are.
+
+  A CODEC HAS TO BE GIVEN AGAIN HERE. The index does not record the one it was
+  created with, so reopening without it leaves a writer that reads the existing
+  segments but writes new ones in the default format — see `->iwc-customizer`."
   ([^String path ^String branch-name]
    (open-branch path branch-name {}))
   ([^String path ^String branch-name {:keys [analyzer metadata-index
-                                             max-merged-segment-mb ram-buffer-mb]}]
+                                             max-merged-segment-mb ram-buffer-mb
+                                             codec iwc-fn]}]
    (let [base-path (->path path)
          analyzer (or analyzer (StandardAnalyzer.))
-         writer (BranchIndexWriter/open base-path branch-name analyzer)
+         writer (BranchIndexWriter/open base-path branch-name analyzer
+                                        (->iwc-customizer codec iwc-fn))
          mi (or metadata-index (metadata/create-metadata-index path))]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer mi nil))))
@@ -156,7 +206,7 @@
     ;; directory is created. The parent must land its buffered writes first, or
     ;; the copy names a manifest that does not yet describe them.
     (let [{:keys [store cache store-id analyzer
-                  max-merged-segment-mb ram-buffer-mb]} (:backing sw)]
+                  max-merged-segment-mb ram-buffer-mb codec iwc-fn]} (:backing sw)]
       ;; CHECK BEFORE COMMITTING. This committed the parent first, so a fork onto
       ;; a name that already exists left a commit point on the source and then
       ;; threw — the same defect the Java `fork` was rewritten to remove, still
@@ -175,12 +225,18 @@
       ;; defaults — including the 5 GB merged-segment cap the remote-store
       ;; guidance exists to keep clear of S3's single-PUT limit. A parent tuned
       ;; to 256 MB silently produced a fork at 5120.
+      ;; The codec is in the same class of setting: fixed at construction, not
+      ;; recorded anywhere, and a fork that dropped it would write its own
+      ;; segments in a format its inherited ones are not in. The directory-backed
+      ;; `fork` carries it on the Java writer; here the option map is the carrier.
       (open-store-index store cache new-branch-name
                         {:metadata-index (->metadata-index sw)
                          :store-id store-id
                          :analyzer analyzer
                          :max-merged-segment-mb max-merged-segment-mb
-                         :ram-buffer-mb ram-buffer-mb}))
+                         :ram-buffer-mb ram-buffer-mb
+                         :codec codec
+                         :iwc-fn iwc-fn}))
     (let [w (->writer sw)
           mi (->metadata-index sw)
           new-writer (.fork w new-branch-name)]
@@ -207,6 +263,8 @@
                 disagreeing about its name.
     :max-merged-segment-mb / :ram-buffer-mb - see `create-index`. Against a
                 remote store start from `scriptum.konserve/remote-tuning`.
+    :codec / :iwc-fn - see `create-index`. Must be given again on every open;
+                the index does not record them.
 
   Returns a ScriptumWriter. Document operations, search, commit and readers
   behave exactly as for a directory-backed index, and `fork` and `branches`
@@ -217,7 +275,8 @@
   does not do."
   ([store cache branch] (open-store-index store cache branch {}))
   ([store ^String cache ^String branch
-    {:keys [analyzer metadata-index store-id max-merged-segment-mb ram-buffer-mb]}]
+    {:keys [analyzer metadata-index store-id max-merged-segment-mb ram-buffer-mb
+            codec iwc-fn]}]
    (let [analyzer (or analyzer (StandardAnalyzer.))
          ;; Default the guard id off the store rather than making the caller
          ;; track it, so two components on one store cannot disagree about its
@@ -239,7 +298,8 @@
          ;; branch gives LockObtainFailedException — nobody owned this Directory
          ;; and its mmap arena, and for a store-backed one the gc-guard sequence
          ;; it may have opened, were left to the garbage collector.
-         writer (try (BranchIndexWriter/createOver dir branch analyzer)
+         writer (try (BranchIndexWriter/createOver dir branch analyzer
+                                                   (->iwc-customizer codec iwc-fn))
                      (catch Throwable t
                        (try (.close ^java.io.Closeable dir) (catch Throwable _))
                        (throw t)))]
@@ -252,7 +312,9 @@
                         ;; not carried here silently reverts to Lucene's defaults.
                         :analyzer analyzer
                         :max-merged-segment-mb max-merged-segment-mb
-                        :ram-buffer-mb ram-buffer-mb}))))
+                        :ram-buffer-mb ram-buffer-mb
+                        :codec codec
+                        :iwc-fn iwc-fn}))))
 
 (defn snapshot-address
   "The immutable address of this branch's current index state, or nil.
@@ -975,8 +1037,14 @@
                ;; open, i.e. the documented main+feature workflow, and erasing
                ;; that branch's metadata on every collection of main is not a
                ;; defensible reading of a lock being held.
+               ;; WITH THIS WRITER'S CUSTOMIZER. A branch opened without the
+               ;; codec it was written with reads fine — a segment names its own
+               ;; format — but any merge the writer takes on rewrites those
+               ;; segments in the default format, which for completion postings
+               ;; means the suggestions are gone and nothing reported it.
                (let [bw (try (BranchIndexWriter/open (->path base-path) bname
-                                                     (StandardAnalyzer.))
+                                                     (StandardAnalyzer.)
+                                                     (.getConfigCustomizer writer))
                              (catch Exception _ nil))]
                  (if-not bw
                    acc

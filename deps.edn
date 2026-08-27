@@ -36,9 +36,13 @@
 
   :test
   {:extra-paths ["test"]
+   ;; lucene-suggest is a TEST dependency only. The point of the codec option on
+   ;; the writer factories is that a caller brings their own suggest module;
+   ;; scriptum takes a `Codec` and never names a completion format itself.
    :extra-deps {io.github.cognitect-labs/test-runner
                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}
-                org.replikativ/hasch {:mvn/version "0.3.96"}}
+                org.replikativ/hasch {:mvn/version "0.3.96"}
+                org.apache.lucene/lucene-suggest {:mvn/version "10.3.2"}}
    :main-opts ["-m" "cognitect.test-runner"]}
 
   ;; Lucene's own Directory conformance suite. `BaseDirectoryTestCase` is what

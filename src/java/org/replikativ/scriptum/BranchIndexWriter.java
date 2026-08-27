@@ -18,15 +18,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.UnaryOperator;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexCommit;
+import org.apache.lucene.index.IndexDeletionPolicy;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.MergePolicy;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.Term;
@@ -165,6 +169,14 @@ public class BranchIndexWriter implements Closeable {
   private final boolean isMainBranch;
   private final boolean cryptoHash;
 
+  /**
+   * The caller's IndexWriterConfig customizer, kept so that {@link #fork(String)} builds its new
+   * writer the same way this one was built. A codec is not a live setting — it is fixed when the
+   * IndexWriter is constructed — so a fork that dropped it would write its own segments in a
+   * different format from the ones it inherited, with nothing failing until a query wanted them.
+   */
+  private final UnaryOperator<IndexWriterConfig> configCustomizer;
+
   // Optional message for the next commit
   private volatile String pendingCommitMessage;
 
@@ -187,7 +199,8 @@ public class BranchIndexWriter implements Closeable {
       Path basePath,
       Analyzer analyzer,
       boolean isMainBranch,
-      boolean cryptoHash) {
+      boolean cryptoHash,
+      UnaryOperator<IndexWriterConfig> configCustomizer) {
     this.writer = writer;
     this.directory = directory;
     this.deletionPolicy = deletionPolicy;
@@ -197,7 +210,78 @@ public class BranchIndexWriter implements Closeable {
     this.analyzer = analyzer;
     this.isMainBranch = isMainBranch;
     this.cryptoHash = cryptoHash;
+    this.configCustomizer = configCustomizer;
     this.segmentHashCache = cryptoHash ? new java.util.concurrent.ConcurrentHashMap<>() : null;
+  }
+
+  /**
+   * Apply the caller's IndexWriterConfig customizer, then check that what branching depends on
+   * survived it.
+   *
+   * <p>The customizer is handed a config scriptum has already configured, and is expected to
+   * MUTATE and return that same object — {@code c -> c.setCodec(codec)} is the shape, since
+   * Lucene's setters return the config. Building a fresh {@code IndexWriterConfig} instead would
+   * drop the deletion policy that keeps old commit points readable, the merge policy that refuses
+   * to merge segments another branch shares, and the open mode. None of those show up at
+   * construction time: the writer is built, and the branch loses its history or its structural
+   * sharing later. So they are checked rather than silently re-asserted, which would instead make
+   * a deliberate override quietly do nothing.
+   *
+   * @param config the config scriptum built, already carrying the branching settings
+   * @param customizer the caller's customizer, or null for today's behavior
+   * @return the config to construct the IndexWriter with
+   */
+  private static IndexWriterConfig customized(
+      IndexWriterConfig config, UnaryOperator<IndexWriterConfig> customizer) throws IOException {
+    if (customizer == null) {
+      return config;
+    }
+    IndexDeletionPolicy deletionPolicy = config.getIndexDeletionPolicy();
+    MergePolicy mergePolicy = config.getMergePolicy();
+    IndexWriterConfig.OpenMode openMode = config.getOpenMode();
+    IndexWriterConfig customized = customizer.apply(config);
+    if (customized == null) {
+      throw new IOException("scriptum: the IndexWriterConfig customizer returned null");
+    }
+    if (customized.getIndexDeletionPolicy() != deletionPolicy
+        || customized.getMergePolicy() != mergePolicy
+        || customized.getOpenMode() != openMode) {
+      throw new IOException(
+          "scriptum: the IndexWriterConfig customizer dropped a setting branching depends on"
+              + " (deletion policy, merge policy or open mode); mutate the config it is handed"
+              + " and return it, rather than returning a new IndexWriterConfig");
+    }
+    return customized;
+  }
+
+  /**
+   * A customizer that only sets the codec, for the case the option exists to serve.
+   *
+   * <p>{@code SuggestField} and {@code ContextSuggestField} need a codec whose {@code
+   * getPostingsFormatForField} answers with a {@code CompletionPostingsFormat}, and that has to be
+   * on the config before the IndexWriter is built. scriptum does not depend on {@code
+   * lucene-suggest} and names no completion format itself; the caller brings the codec.
+   *
+   * <pre>
+   *   BranchIndexWriter.create(path, "main", analyzer, false, BranchIndexWriter.withCodec(codec));
+   * </pre>
+   *
+   * @param codec the codec new segments are written with
+   * @return a customizer setting that codec and changing nothing else
+   */
+  public static UnaryOperator<IndexWriterConfig> withCodec(Codec codec) {
+    return config -> config.setCodec(codec);
+  }
+
+  /**
+   * The IndexWriterConfig customizer this writer was built with, or null.
+   *
+   * <p>For callers that reopen a branch themselves and have to reproduce it — a codec is fixed at
+   * construction, so an unadorned reopen of a branch written with one is a writer that will not
+   * write it.
+   */
+  public UnaryOperator<IndexWriterConfig> getConfigCustomizer() {
+    return configCustomizer;
   }
 
   /** Initialize lastCommitId from the latest existing commit's UUID. */
@@ -321,6 +405,25 @@ public class BranchIndexWriter implements Closeable {
    */
   public static BranchIndexWriter createOver(Directory directory, String branchName, Analyzer analyzer)
       throws IOException {
+    return createOver(directory, branchName, analyzer, null);
+  }
+
+  /**
+   * As {@link #createOver(Directory, String, Analyzer)}, with the IndexWriterConfig customized
+   * before the writer is built. See {@link #withCodec(Codec)}.
+   *
+   * @param directory the Directory to write through; this writer closes it
+   * @param branchName the branch this writer is on
+   * @param analyzer the analyzer to use for text processing
+   * @param configCustomizer applied to the config scriptum built; null for today's behavior
+   * @return a new BranchIndexWriter with no base path
+   */
+  public static BranchIndexWriter createOver(
+      Directory directory,
+      String branchName,
+      Analyzer analyzer,
+      UnaryOperator<IndexWriterConfig> configCustomizer)
+      throws IOException {
     BranchDeletionPolicy deletionPolicy = new BranchDeletionPolicy();
     BranchAwareMergePolicy mergePolicy =
         new BranchAwareMergePolicy(new org.apache.lucene.index.TieredMergePolicy());
@@ -330,7 +433,7 @@ public class BranchIndexWriter implements Closeable {
     config.setMergePolicy(mergePolicy);
     config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
 
-    IndexWriter writer = new IndexWriter(directory, config);
+    IndexWriter writer = new IndexWriter(directory, customized(config, configCustomizer));
 
     // isMainBranch from the NAME, not a constant. It was hardcoded true, so every
     // store-backed branch — forks included — answered true to isMainBranch(), and
@@ -340,7 +443,7 @@ public class BranchIndexWriter implements Closeable {
     BranchIndexWriter biw =
         new BranchIndexWriter(
             writer, directory, deletionPolicy, mergePolicy, branchName, null, analyzer,
-            MAIN_BRANCH_NAME.equals(branchName), false);
+            MAIN_BRANCH_NAME.equals(branchName), false, configCustomizer);
 
     // Adopt the branch's existing head, exactly as create() and open() do.
     // Skipping it left lastCommitId null on every reopen, so the next commit
@@ -361,6 +464,38 @@ public class BranchIndexWriter implements Closeable {
 
   public static BranchIndexWriter create(
       Path basePath, String branchName, Analyzer analyzer, boolean cryptoHash) throws IOException {
+    return create(basePath, branchName, analyzer, cryptoHash, null);
+  }
+
+  /**
+   * As {@link #create(Path, String, Analyzer, boolean)}, with the IndexWriterConfig customized
+   * before the writer is built.
+   *
+   * <p>THE ONLY PLACE SOME LUCENE SETTINGS CAN BE REACHED. A codec is fixed when the IndexWriter
+   * is constructed — {@code getIndexWriter().getConfig()} hands back a {@code
+   * LiveIndexWriterConfig}, where it is read-only — so there is no post-construction escape hatch
+   * for one. That is what {@code SuggestField} needs: a codec whose {@code
+   * getPostingsFormatForField} answers with a {@code CompletionPostingsFormat}. See {@link
+   * #withCodec(Codec)}.
+   *
+   * <p>The customizer is carried on the writer, so {@link #fork(String)} builds the fork's writer
+   * the same way. Reopening the branch later with {@link #open(Path, String, Analyzer)} does NOT
+   * remember it — nothing about it is recorded in the index — so pass it there too.
+   *
+   * @param basePath the root path for the index
+   * @param branchName the name of the branch
+   * @param analyzer the analyzer to use for text processing
+   * @param cryptoHash if true, use merkle hashing for commits
+   * @param configCustomizer applied to the config scriptum built; null for today's behavior
+   * @return a new BranchIndexWriter
+   */
+  public static BranchIndexWriter create(
+      Path basePath,
+      String branchName,
+      Analyzer analyzer,
+      boolean cryptoHash,
+      UnaryOperator<IndexWriterConfig> configCustomizer)
+      throws IOException {
     checkBranchName(branchName);
     Files.createDirectories(basePath);
 
@@ -406,7 +541,7 @@ public class BranchIndexWriter implements Closeable {
 
     IndexWriter writer;
     try {
-      writer = new IndexWriter(branchDir, config);
+      writer = new IndexWriter(branchDir, customized(config, configCustomizer));
     } catch (IOException e) {
       branchDir.close();
       throw e;
@@ -415,7 +550,7 @@ public class BranchIndexWriter implements Closeable {
     BranchIndexWriter biw =
         new BranchIndexWriter(
             writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer, isMain,
-            cryptoHash);
+            cryptoHash, configCustomizer);
 
     // Initialize parent tracking from existing commits
     biw.initLastCommitId();
@@ -438,6 +573,30 @@ public class BranchIndexWriter implements Closeable {
    * @return a BranchIndexWriter for the branch
    */
   public static BranchIndexWriter open(Path basePath, String branchName, Analyzer analyzer)
+      throws IOException {
+    return open(basePath, branchName, analyzer, null);
+  }
+
+  /**
+   * As {@link #open(Path, String, Analyzer)}, with the IndexWriterConfig customized before the
+   * writer is built.
+   *
+   * <p>A REOPEN NEEDS THIS TOO. The customizer is not recorded in the index, so a branch created
+   * with a codec and reopened without one gets a writer that reads its existing segments fine —
+   * the format is named per segment — and writes every new one in the default format. Nothing
+   * fails; the suggestions simply stop arriving for the newer documents.
+   *
+   * @param basePath the root path of the index
+   * @param branchName the name of the branch to open
+   * @param analyzer the analyzer to use
+   * @param configCustomizer applied to the config scriptum built; null for today's behavior
+   * @return a BranchIndexWriter for the branch
+   */
+  public static BranchIndexWriter open(
+      Path basePath,
+      String branchName,
+      Analyzer analyzer,
+      UnaryOperator<IndexWriterConfig> configCustomizer)
       throws IOException {
     // ONLY THE UNSAFE FORMS, not the whitelist. `create` and `fork` may be strict
     // about names they are about to invent; `open` may not, because scriptum has
@@ -466,7 +625,7 @@ public class BranchIndexWriter implements Closeable {
         } catch (IOException e) {
           // Default to false if we can't read
         }
-        return create(basePath, branchName, analyzer, cryptoHash);
+        return create(basePath, branchName, analyzer, cryptoHash, configCustomizer);
       }
       throw new IOException(
           "scriptum: branch " + branchName + " does not exist at " + branchPath
@@ -511,7 +670,7 @@ public class BranchIndexWriter implements Closeable {
 
         IndexWriter writer;
         try {
-          writer = new IndexWriter(branchDir, config);
+          writer = new IndexWriter(branchDir, customized(config, configCustomizer));
         } catch (IOException e) {
           branchDir.close();
           throw e;
@@ -529,7 +688,7 @@ public class BranchIndexWriter implements Closeable {
         BranchIndexWriter biw =
             new BranchIndexWriter(
                 writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer,
-                false, cryptoHash);
+                false, cryptoHash, configCustomizer);
         biw.initLastCommitId();
     biw.initLastContentHash();
         return biw;
@@ -697,7 +856,7 @@ public class BranchIndexWriter implements Closeable {
 
         IndexWriter newWriter;
         try {
-          newWriter = new IndexWriter(newBranchDir, newConfig);
+          newWriter = new IndexWriter(newBranchDir, customized(newConfig, configCustomizer));
         } catch (IOException e) {
           newBranchDir.close();
           throw e;
@@ -706,7 +865,7 @@ public class BranchIndexWriter implements Closeable {
         BranchIndexWriter forked =
             new BranchIndexWriter(
                 newWriter, newBranchDir, newDeletionPolicy, newMergePolicy, newBranchName, basePath,
-                analyzer, false, this.cryptoHash);
+                analyzer, false, this.cryptoHash, this.configCustomizer);
         forked.lastCommitId = this.lastCommitId;
         return forked;
       } catch (IOException e) {
