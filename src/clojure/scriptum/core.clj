@@ -22,11 +22,13 @@
            [org.apache.lucene.document Document Field$Store TextField StringField
             IntField LongField FloatField DoubleField StoredField
             KnnFloatVectorField]
-           [org.apache.lucene.index DirectoryReader IndexableField Term
-            VectorSimilarityFunction]
+           [org.apache.lucene.index DirectoryReader IndexReader IndexableField
+            LeafReaderContext Term VectorSimilarityFunction]
            [org.apache.lucene.search IndexSearcher Query TermQuery TermInSetQuery PrefixQuery ConstantScoreQuery BooleanQuery
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
             FieldDoc Sort MatchAllDocsQuery KnnFloatVectorQuery]
+           [org.apache.lucene.search.join QueryBitSetProducer ScoreMode
+            ToChildBlockJoinQuery ToParentBlockJoinQuery]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
            [org.apache.lucene.store Directory FSDirectory]
            [org.apache.lucene.util BytesRef]
@@ -621,7 +623,82 @@
   [^String path]
   (BranchIndexWriter/discoverBranches (->path path)))
 
+;; --- Nested Documents ---
+;;
+;; ES-style `nested` objects, as Lucene block joins. A block is a root's child
+;; documents followed by the root, written in ONE `addDocuments` call so that it
+;; is contiguous: a block join finds a child's root as the next root after it.
+;; Children carry `nested-path-field` and roots never do, so a document WITHOUT
+;; it is a root — which makes every index written before nested existed valid
+;; as it stands.
+;;
+;; THE HAZARD IS A ROOT DELETED WITHOUT ITS CHILDREN. Until a merge, a nested
+;; query still returns the deleted root through its live children; after one
+;; they silently join the NEXT root's block, and `CheckJoinIndex` passes the
+;; result. Every write path below therefore treats a root and its children as
+;; one unit, and the block-building ones refuse a block that does not end in
+;; its root.
+;;
+;; So a delete or update has two forms. On a branch that has never held a child
+;; it is the plain term write it always was, because a buffered term delete
+;; costs less than the query delete that takes a block whole; everywhere else it
+;; goes through `block-delete-query`. BranchIndexWriter's `mayHoldNested` latch
+;; picks, and `writeFlatOrNested` makes the pick atomic with the write: checked
+;; separately, a nested block for the same root landing in between was split by
+;; the term delete that followed.
+
+(def ^String nested-path-field
+  "The field every nested child carries, holding its path (\"comments\").
+  Roots never carry it."
+  BranchIndexWriter/NESTED_PATH_FIELD)
+
+(def ^Query roots-query
+  "Matches every document that is not a nested child, i.e. every root.
+
+  `exists` is a PrefixQuery on the empty prefix, which matches any indexed
+  value. `FieldExistsQuery` cannot stand in: it reads doc values or norms, a
+  StringField has neither, and it throws."
+  (-> (BooleanQuery$Builder.)
+      (.add (MatchAllDocsQuery.) BooleanClause$Occur/FILTER)
+      (.add (PrefixQuery. (Term. ^String nested-path-field ""))
+            BooleanClause$Occur/MUST_NOT)
+      (.build)))
+
+(def roots-bitset
+  "The parents filter of every block join here.
+
+  ONE SHARED INSTANCE, because `QueryBitSetProducer` caches its bitset per
+  segment core; a fresh producer per query would recompute it on every search."
+  (QueryBitSetProducer. roots-query))
+
+(defn- block-delete-query
+  "What a delete matching `q` must become on an index holding nested documents.
+
+  Matches only ROOTS, and each root takes its children with it. That is ES's
+  rule — a single nested object cannot be deleted, only its root reindexed —
+  and the only one that cannot orphan children. So a `q` that only children
+  can satisfy deletes nothing."
+  ^Query [^Query q]
+  (let [roots (-> (BooleanQuery$Builder.)
+                  (.add q BooleanClause$Occur/FILTER)
+                  (.add roots-query BooleanClause$Occur/FILTER)
+                  (.build))]
+    (-> (BooleanQuery$Builder.)
+        (.add roots BooleanClause$Occur/SHOULD)
+        (.add (ToChildBlockJoinQuery. roots roots-bitset) BooleanClause$Occur/SHOULD)
+        (.build))))
+
 ;; --- Document Operations ---
+
+(defn- child-doc?
+  "Whether `doc`, an iterable of IndexableField, carries `nested-path-field`."
+  [^Iterable doc]
+  (let [it (.iterator doc)]
+    (loop []
+      (cond
+        (not (.hasNext it)) false
+        (= nested-path-field (.name ^IndexableField (.next it))) true
+        :else (recur)))))
 
 (defn add-document
   "Add a pre-built Lucene document or other iterable of IndexableField values.
@@ -629,9 +706,157 @@
    This is the allocation-conscious integration path for callers with a fixed
    schema. `add-doc` remains the convenient data-driven map API. Keeping this
    operation here avoids exposing BranchIndexWriter as part of an adapter's
-   mutation protocol."
+   mutation protocol.
+
+   A nested child is refused: written alone it has no root after it, so it
+   would join whichever root is written next. Use `add-block`."
   [sw doc]
+  (when (child-doc? doc)
+    (throw (ex-info (str "scriptum: a document carrying " nested-path-field
+                         " is a nested child; add it in a block with its root, via add-block")
+                    {:field nested-path-field})))
   (.addDocument ^BranchIndexWriter (->writer sw) doc))
+
+(defn add-block
+  "Add a pre-built block of Lucene documents: children first, root LAST.
+
+  The typed counterpart of `add-document` for nested documents. The block goes
+  in ONE `addDocuments` call, so it is contiguous and atomic. Every child
+  carries `nested-path-field` (a StringField holding its path), and the root,
+  last, does not.
+
+  ANY OTHER SHAPE IS REFUSED BEFORE ANYTHING IS WRITTEN, because Lucene would
+  accept it and nothing would report it. A child missing the field is a root to
+  every query and delete: the children before it become ITS children, and it
+  turns up in results as a root of its own. Children with no root after them
+  join the next root written, whoever's that is."
+  [sw docs]
+  (let [docs (vec docs)]
+    (when-not (and (seq docs)
+                   (not (child-doc? (peek docs)))
+                   (every? child-doc? (pop docs)))
+      (throw (ex-info (str "scriptum: a block is its children, each carrying "
+                           nested-path-field ", then one root without it")
+                      {:shape (mapv #(if (child-doc? %) :child :root) docs)})))
+    (.addDocuments ^BranchIndexWriter (->writer sw) ^Iterable docs)))
+
+(defn- add-field!
+  "Add the Lucene fields one doc-map entry describes to `doc`, under `fname`.
+
+  THE ONE FIELD BUILDER. `add-doc` and `update-doc` each carried a copy of
+  this, and a nested child needs the same spec syntax under a prefixed name —
+  the alternative was a third."
+  [^Document doc ^String fname value-or-opts]
+  (let [opts (if (map? value-or-opts) value-or-opts {:value value-or-opts})
+        {:keys [value stored? store? type similarity]} opts
+        store? (cond
+                 (contains? opts :stored?) stored?
+                 (contains? opts :store?) store?
+                 :else true)
+        store (if store? Field$Store/YES Field$Store/NO)
+
+        ;; Auto-detect type from value (only if type not explicitly provided)
+        [detected-type value']
+        (if (contains? opts :type)
+          [type value]
+          (cond
+            (instance? java.time.Instant value) [:long (.toEpochMilli ^Instant value)]
+            (instance? java.util.Date value) [:long (.getTime ^java.util.Date value)]
+            (and (class value) (= (.getName (class value)) "[F")) [:vector value]
+            :else [:text value]))
+
+        final-type detected-type
+
+        ;; Handle multi-valued fields (vector of values)
+        values (if (and (vector? value') (not= final-type :vector))
+                 value'
+                 [value'])]
+
+    (doseq [v values]
+      (case final-type
+        :text
+        (.add doc (TextField. fname (str v) store))
+
+        :string
+        (.add doc (StringField. fname (str v) store))
+
+        :int
+        (.add doc (IntField. fname (int v) store))
+
+        :long
+        (.add doc (LongField. fname (long v) store))
+
+        :float
+        (.add doc (FloatField. fname (float v) store))
+
+        :double
+        (.add doc (DoubleField. fname (double v) store))
+
+        :stored-only
+        (.add doc (StoredField. fname
+                                (cond
+                                  (string? v) v
+                                  (int? v) (int v)
+                                  (instance? Long v) (long v)
+                                  (instance? Float v) (float v)
+                                  (instance? Double v) (double v)
+                                  (bytes? v) v
+                                  :else (str v))))
+
+        :vector
+        (let [sim (case (or similarity :euclidean)
+                    :euclidean VectorSimilarityFunction/EUCLIDEAN
+                    :cosine VectorSimilarityFunction/COSINE
+                    :dot-product VectorSimilarityFunction/DOT_PRODUCT
+                    :max-inner-product VectorSimilarityFunction/MAXIMUM_INNER_PRODUCT)]
+          (.add doc (KnnFloatVectorField. fname ^floats v sim)))))))
+
+(defn- nested-spec? [value-or-opts]
+  (and (map? value-or-opts) (= :nested (:type value-or-opts))))
+
+(defn- ->document
+  "The Document for `doc-map`'s own fields, each name prefixed by `prefix` when
+  one is given. `:nested` entries are skipped; they become separate documents.
+
+  `nested-path-field` is refused as a field name: on a root it would make the
+  root a child, attached with its own children to the next root written."
+  ^Document [prefix doc-map]
+  (let [doc (Document.)]
+    (doseq [[field-name value-or-opts] doc-map
+            :when (not (nested-spec? value-or-opts))
+            :let [fname (cond->> (name field-name) prefix (str prefix))]]
+      (when (= nested-path-field fname)
+        (throw (ex-info (str "scriptum: " nested-path-field " is reserved for nested children")
+                        {:field fname})))
+      (add-field! doc fname value-or-opts))
+    doc))
+
+(defn- child-documents
+  "The documents of one `:nested` field's children: each child map's fields
+  under `<path>.<name>`, as ES names them, plus `nested-path-field`."
+  [^String path children]
+  (when-not (or (nil? children)
+                (and (sequential? children) (every? map? children)))
+    (throw (ex-info "scriptum: a :nested field's :value must be a vector of maps"
+                    {:path path :value children})))
+  (mapv (fn [child]
+          (when (some nested-spec? (vals child))
+            (throw (ex-info "scriptum: nesting inside a nested object is not supported"
+                            {:path path :child child})))
+          (doto (->document (str path ".") child)
+            (.add (StringField. ^String nested-path-field path Field$Store/NO))))
+        children))
+
+(defn- ->block
+  "The documents `doc-map` is indexed as: the children of each `:nested` field,
+  in doc-map order, then the root. A single document when there are none."
+  [doc-map]
+  (conj (into []
+              (mapcat (fn [[field-name value-or-opts]]
+                        (when (nested-spec? value-or-opts)
+                          (child-documents (name field-name) (:value value-or-opts)))))
+              doc-map)
+        (->document nil doc-map)))
 
 (defn add-doc
   "Add a document to the branch.
@@ -648,6 +873,8 @@
     :double      - Double with range queries + sorting (DoubleField)
     :stored-only - Store but don't index (StoredField)
     :vector      - KNN float vector search (KnnFloatVectorField)
+    :nested      - Vector of child maps, each indexed as its own document
+                   (ES `nested`); query them with `nested-query`
 
   Auto-detection:
     - java.time.Instant → :long (epoch millis)
@@ -669,6 +896,18 @@
                      :embedding {:value (float-array [...]) :type :vector
                                  :similarity :cosine}})
 
+  Nested objects:
+    (add-doc writer {:title \"Post\"
+                     :comments {:type :nested
+                                :value [{:author {:value \"alice\" :type :string}
+                                         :stars {:value 5 :type :int}}]}})
+
+  A child map takes the same field specs as a doc-map, and its fields are
+  named `<path>.<name>` (\"comments.author\"). The children are written before
+  their root in one atomic block. A `:nested` field inside a child throws:
+  only one level is supported. Nothing returns a child's stored fields yet (ES's
+  inner hits), so keep whatever a result must show on the root.
+
   For fine-grained control, use Lucene classes directly:
     (let [doc (Document.)]
       (.add doc (TextField. \"body\" text Field$Store/NO))
@@ -676,164 +915,69 @@
       (.addDocument writer doc))"
   [sw doc-map]
   (let [^BranchIndexWriter writer (->writer sw)
-        doc (Document.)]
-    (doseq [[field-name value-or-opts] doc-map]
-      (let [fname (name field-name)
-            opts (if (map? value-or-opts) value-or-opts {:value value-or-opts})
-            {:keys [value stored? store? type similarity]} opts
-            store? (cond
-                     (contains? opts :stored?) stored?
-                     (contains? opts :store?) store?
-                     :else true)
-            store (if store? Field$Store/YES Field$Store/NO)
-
-            ;; Auto-detect type from value (only if type not explicitly provided)
-            [detected-type value']
-            (if (contains? opts :type)
-              [type value]
-              (cond
-                (instance? java.time.Instant value) [:long (.toEpochMilli ^Instant value)]
-                (instance? java.util.Date value) [:long (.getTime ^java.util.Date value)]
-                (and (class value) (= (.getName (class value)) "[F")) [:vector value]
-                :else [:text value]))
-
-            final-type detected-type
-
-            ;; Handle multi-valued fields (vector of values)
-            values (if (and (vector? value') (not= final-type :vector))
-                     value'
-                     [value'])]
-
-        (doseq [v values]
-          (case final-type
-            :text
-            (.add doc (TextField. fname (str v) store))
-
-            :string
-            (.add doc (StringField. fname (str v) store))
-
-            :int
-            (.add doc (IntField. fname (int v) store))
-
-            :long
-            (.add doc (LongField. fname (long v) store))
-
-            :float
-            (.add doc (FloatField. fname (float v) store))
-
-            :double
-            (.add doc (DoubleField. fname (double v) store))
-
-            :stored-only
-            (.add doc (StoredField. fname
-                                    (cond
-                                      (string? v) v
-                                      (int? v) (int v)
-                                      (instance? Long v) (long v)
-                                      (instance? Float v) (float v)
-                                      (instance? Double v) (double v)
-                                      (bytes? v) v
-                                      :else (str v))))
-
-            :vector
-            (let [sim (case (or similarity :euclidean)
-                        :euclidean VectorSimilarityFunction/EUCLIDEAN
-                        :cosine VectorSimilarityFunction/COSINE
-                        :dot-product VectorSimilarityFunction/DOT_PRODUCT
-                        :max-inner-product VectorSimilarityFunction/MAXIMUM_INNER_PRODUCT)]
-              (.add doc (KnnFloatVectorField. fname ^floats v sim)))))))
-    (.addDocument writer doc)))
+        block (->block doc-map)]
+    (if (next block)
+      (.addDocuments writer ^Iterable block)
+      (.addDocument writer ^Iterable (first block)))))
 
 (defn delete-docs
-  "Delete documents matching the given term field and value."
+  "Delete documents matching the given term field and value.
+
+  On an index holding nested documents this matches ROOTS only, and deletes
+  each with its children; a value that only children carry deletes nothing."
   [sw ^String field ^String value]
-  (let [^BranchIndexWriter writer (->writer sw)]
-    (.deleteDocuments writer (into-array Term [(Term. field value)]))))
+  (let [^BranchIndexWriter writer (->writer sw)
+        term (Term. field value)]
+    (.writeFlatOrNested
+     writer
+     #(.deleteDocuments writer ^"[Lorg.apache.lucene.index.Term;" (into-array Term [term]))
+     #(.deleteDocuments writer ^"[Lorg.apache.lucene.search.Query;"
+                        (into-array Query [(block-delete-query (TermQuery. term))])))))
 
 (defn delete-query
   "Delete documents matching a pre-built Lucene query.
 
    This is the typed counterpart to `delete-docs`: integrations using numeric,
    point, or other non-Term fields can keep their native representation without
-   reaching through Scriptum to its BranchIndexWriter."
+   reaching through Scriptum to its BranchIndexWriter.
+
+   On an index holding nested documents only the ROOTS `query` matches are
+   deleted, each with its children, as in `delete-docs`."
   [sw ^Query query]
-  (let [^BranchIndexWriter writer (->writer sw)]
-    (.deleteDocuments writer (into-array Query [query]))))
+  (let [^BranchIndexWriter writer (->writer sw)
+        delete! (fn [^Query q]
+                  (.deleteDocuments writer ^"[Lorg.apache.lucene.search.Query;"
+                                    (into-array Query [q])))]
+    (.writeFlatOrNested writer
+                        #(delete! query)
+                        #(delete! (block-delete-query query)))))
 
 (defn update-doc
   "Update a document identified by the given term.
 
   Replaces the document matching (field, value) with the new doc-map.
-  doc-map uses the same format as add-doc (supports all field types, multi-valued fields, auto-detection)."
+  doc-map uses the same format as add-doc (supports all field types, multi-valued fields, auto-detection, :nested).
+
+  REPLACES A WHOLE BLOCK. On an index holding nested documents the matched
+  root is deleted with all its children and the new block added in the same
+  atomic step, so changing one nested object means reindexing its root, as in
+  ES. Only roots match: a (field, value) that only children carry replaces
+  nothing, and the new block is simply added."
   [sw ^String field ^String value doc-map]
   (let [^BranchIndexWriter writer (->writer sw)
-        doc (Document.)]
-    (doseq [[field-name value-or-opts] doc-map]
-      (let [fname (name field-name)
-            opts (if (map? value-or-opts) value-or-opts {:value value-or-opts})
-            {:keys [value stored? store? type similarity]} opts
-            store? (cond
-                     (contains? opts :stored?) stored?
-                     (contains? opts :store?) store?
-                     :else true)
-            store (if store? Field$Store/YES Field$Store/NO)
-
-            ;; Auto-detect type from value (only if type not explicitly provided)
-            [detected-type value']
-            (if (contains? opts :type)
-              [type value]
-              (cond
-                (instance? java.time.Instant value) [:long (.toEpochMilli ^Instant value)]
-                (instance? java.util.Date value) [:long (.getTime ^java.util.Date value)]
-                (and (class value) (= (.getName (class value)) "[F")) [:vector value]
-                :else [:text value]))
-
-            final-type detected-type
-
-            ;; Handle multi-valued fields (vector of values)
-            values (if (and (vector? value') (not= final-type :vector))
-                     value'
-                     [value'])]
-
-        (doseq [v values]
-          (case final-type
-            :text
-            (.add doc (TextField. fname (str v) store))
-
-            :string
-            (.add doc (StringField. fname (str v) store))
-
-            :int
-            (.add doc (IntField. fname (int v) store))
-
-            :long
-            (.add doc (LongField. fname (long v) store))
-
-            :float
-            (.add doc (FloatField. fname (float v) store))
-
-            :double
-            (.add doc (DoubleField. fname (double v) store))
-
-            :stored-only
-            (.add doc (StoredField. fname
-                                    (cond
-                                      (string? v) v
-                                      (int? v) (int v)
-                                      (instance? Long v) (long v)
-                                      (instance? Float v) (float v)
-                                      (instance? Double v) (double v)
-                                      (bytes? v) v
-                                      :else (str v))))
-
-            :vector
-            (let [sim (case (or similarity :euclidean)
-                        :euclidean VectorSimilarityFunction/EUCLIDEAN
-                        :cosine VectorSimilarityFunction/COSINE
-                        :dot-product VectorSimilarityFunction/DOT_PRODUCT
-                        :max-inner-product VectorSimilarityFunction/MAXIMUM_INNER_PRODUCT)]
-              (.add doc (KnnFloatVectorField. fname ^floats v sim)))))))
-    (.updateDocument writer (Term. field value) doc)))
+        term (Term. field value)
+        block (->block doc-map)
+        replace-block #(.updateDocuments writer (block-delete-query (TermQuery. term))
+                                         ^Iterable block)]
+    (if (next block)
+      ;; ALWAYS BLOCK-SAFE, even when these are the branch's first children and
+      ;; no document the term matches has any. That held only at the check: the
+      ;; write sets the latch and then runs, and another thread's block for the
+      ;; same root can land in between, which a term delete would split.
+      (replace-block)
+      (.writeFlatOrNested writer
+                          #(.updateDocument writer term ^Iterable (first block))
+                          replace-block))))
 
 ;; --- Commit & Sync ---
 
@@ -1140,6 +1284,15 @@
                                 (repeat (count fields) BooleanClause$Occur/SHOULD))]
      (MultiFieldQueryParser/parse text field-arr occurs-arr analyzer))))
 
+(defn- clause->query
+  "A Lucene Query, or the `{:term [field value]}` shorthand for one."
+  ^Query [q]
+  (cond
+    (instance? org.apache.lucene.search.Query q) q
+    (map? q) (let [[field value] (:term q)]
+               (TermQuery. (Term. (name field) (str value))))
+    :else (throw (ex-info "Unknown query type" {:query q}))))
+
 (defn bool-query
   "Build a BooleanQuery from clause specs.
 
@@ -1153,11 +1306,7 @@
   [clauses]
   (let [builder (BooleanQuery$Builder.)]
     (doseq [[q occur] clauses]
-      (let [lucene-q (cond
-                       (instance? org.apache.lucene.search.Query q) q
-                       (map? q) (let [[field value] (:term q)]
-                                  (TermQuery. (Term. (name field) (str value))))
-                       :else (throw (ex-info "Unknown query type" {:query q})))
+      (let [lucene-q (clause->query q)
             lucene-occur (case occur
                            :must     BooleanClause$Occur/MUST
                            :should   BooleanClause$Occur/SHOULD
@@ -1166,35 +1315,95 @@
         (.add builder lucene-q lucene-occur)))
     (.build builder)))
 
+(defn nested-query
+  "Match the roots that have a child under `path` matching `child-query` —
+  ES's `nested` query.
+
+  `child-query` is a Lucene Query or `{:term [field value]}`, over the
+  children's fully qualified field names (\"comments.author\"). Because every
+  condition in it must hold for ONE child, a bool of two conditions finds a
+  root only when a single child satisfies both — the cross-object false
+  positive a flattened field cannot avoid.
+
+  Options:
+    :score-mode - how the matching children's scores become the root's:
+                  :avg (default, as in ES), :max, :min, :sum or :none
+
+  Example:
+    (nested-query :comments (bool-query [[{:term [:comments.author \"alice\"]} :filter]
+                                         [(IntField/newExactQuery \"comments.stars\" 5) :filter]])
+                  {:score-mode :max})"
+  ([path child-query]
+   (nested-query path child-query {}))
+  ([path child-query {:keys [score-mode] :or {score-mode :avg}}]
+   (let [path (name path)
+         mode (case score-mode
+                :avg ScoreMode/Avg
+                :max ScoreMode/Max
+                :min ScoreMode/Min
+                :sum ScoreMode/Total
+                :none ScoreMode/None
+                (throw (ex-info "scriptum: :score-mode must be :avg, :max, :min, :sum or :none"
+                                {:score-mode score-mode})))
+         ;; ToParentBlockJoinQuery requires that its child query never match
+         ;; a root. The path filter guarantees it whatever `child-query` is,
+         ;; and keeps a query under one path from matching another's children.
+         children (-> (BooleanQuery$Builder.)
+                      (.add (clause->query child-query) BooleanClause$Occur/MUST)
+                      (.add (TermQuery. (Term. ^String nested-path-field ^String path))
+                            BooleanClause$Occur/FILTER)
+                      (.build))]
+     (ToParentBlockJoinQuery. children roots-bitset mode))))
+
 ;; --- Search ---
 
+(defn- nested-reader?
+  "Whether any segment of `reader` has ever held a nested child."
+  [^IndexReader reader]
+  (boolean (some (fn [^LeafReaderContext ctx]
+                   (.fieldInfo (.getFieldInfos (.reader ctx)) ^String nested-path-field))
+                 (.leaves reader))))
+
 (defn- ->query
-  "Normalize Scriptum's public query forms against `reader`."
+  "Normalize Scriptum's public query forms against `reader`.
+
+  ONLY ROOTS ARE RESULTS. Where `reader` holds nested children the query is
+  filtered to roots, so a child never surfaces as a hit of its own and `:all`
+  counts roots, as ES's `_count` does. MUST plus FILTER keeps the query's own
+  score, so score-ordered pages are unaffected, and a continuation compares
+  this output on both sides. A reader with no children gets the query
+  unchanged — the same object."
   [^DirectoryReader reader query]
-  (cond
-    (instance? org.apache.lucene.search.Query query)
-    query
+  (let [q (cond
+            (instance? org.apache.lucene.search.Query query)
+            query
 
-    (map? query)
-    (let [[field value] (:term query)]
-      (TermQuery. (Term. (name field) (str value))))
+            (map? query)
+            (let [[field value] (:term query)]
+              (TermQuery. (Term. (name field) (str value))))
 
-    (string? query)
-    (let [fields (into-array String
-                             (sort (org.apache.lucene.index.FieldInfos/getIndexedFields
-                                    reader)))]
-      (if (zero? (alength fields))
-        (MatchAllDocsQuery.)
-        (.parse (MultiFieldQueryParser. fields (StandardAnalyzer.)) ^String query)))
+            (string? query)
+            (let [fields (into-array String
+                                     (sort (org.apache.lucene.index.FieldInfos/getIndexedFields
+                                            reader)))]
+              (if (zero? (alength fields))
+                (MatchAllDocsQuery.)
+                (.parse (MultiFieldQueryParser. fields (StandardAnalyzer.)) ^String query)))
 
-    (= :all query)
-    (MatchAllDocsQuery.)
+            (= :all query)
+            (MatchAllDocsQuery.)
 
-    :else
-    (throw (ex-info (str "scriptum: unsupported query " (pr-str query)
-                         " — pass :all, {:term [field value]}, a string, "
-                         "or a Lucene Query")
-                    {:query query}))))
+            :else
+            (throw (ex-info (str "scriptum: unsupported query " (pr-str query)
+                                 " — pass :all, {:term [field value]}, a string, "
+                                 "or a Lucene Query")
+                            {:query query})))]
+    (if (nested-reader? reader)
+      (-> (BooleanQuery$Builder.)
+          (.add ^Query q BooleanClause$Occur/MUST)
+          (.add roots-query BooleanClause$Occur/FILTER)
+          (.build))
+      q)))
 
 (defn- hits->results
   [^IndexSearcher searcher hits fields]
@@ -1220,6 +1429,9 @@
     - A Lucene Query object
     - A map {:term [field value]} for a term query
     - A string (matches all documents containing this term in any field)
+
+  Only root documents are results. `nested-query` matches children but returns
+  their roots, with the root's stored fields only: no child's fields come back.
 
   Options:
     :limit - max results (default 10)
@@ -1327,7 +1539,10 @@
 
   This is the selectivity primitive for callers choosing between an inverted
   index and a primary scan.  It uses the snapshot's already-open reader, so the
-  estimate names exactly the same generation as a subsequent candidate scan."
+  estimate names exactly the same generation as a subsequent candidate scan.
+
+  On an index holding nested documents it counts ROOTS, as `search` returns
+  them: `:all` is the number of roots, and nested children are not counted."
   [^StoreSnapshot snapshot query]
   (let [^DirectoryReader reader (:reader snapshot)
         searcher (IndexSearcher. reader)]
@@ -1377,7 +1592,10 @@
   pages an error even when `:query-id` is omitted or accidentally reused.
   `:query-id` remains useful as an adapter-owned semantic fingerprint in
   addition to that structural check; it is copied into the continuation and
-  checked on resume."
+  checked on resume.
+
+  On an index holding nested documents the candidates are ROOTS only, as in
+  `search`; the continuation's query then carries the root filter."
   ([snapshot query]
    (candidate-page snapshot query {}))
   ([^StoreSnapshot snapshot query {:keys [page-size after fields query-id order]
@@ -1616,13 +1834,20 @@
 ;; --- Accessors ---
 
 (defn num-docs
-  "Returns the number of documents in this branch (excluding deletions)."
+  "Returns the number of documents in this branch (excluding deletions).
+
+  Counts LUCENE documents, so every nested child counts as one, as in ES's
+  index-stats `docs.count`. For the number of roots use
+  `(count-store-snapshot snap :all)`, or count `roots-query` over any reader:
+  `(.count (IndexSearcher. reader) roots-query)`."
   [sw]
   (let [^BranchIndexWriter writer (->writer sw)]
     (.numDocs writer)))
 
 (defn max-doc
-  "Returns the total number of documents (including deletions)."
+  "Returns the total number of documents (including deletions).
+
+  Counts Lucene documents, nested children included; see `num-docs`."
   [sw]
   (let [^BranchIndexWriter writer (->writer sw)]
     (.maxDoc writer)))

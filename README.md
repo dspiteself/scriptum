@@ -174,7 +174,7 @@ Scriptum's field types are designed for real-world use cases like email indexing
 (sc/discover-branches path)                           ; => #{"feature"} — forks only, not main
 
 ;; Accessors
-(sc/num-docs writer)                ; document count (excluding deletions)
+(sc/num-docs writer)                ; document count (excluding deletions; nested children count)
 (sc/max-doc writer)                 ; document count (including deletions)
 (sc/branch-name writer)             ; current branch name
 (sc/base-path writer)               ; index base path
@@ -189,6 +189,7 @@ Field types:
 - `:int`, `:long`, `:float`, `:double` - Numeric fields with range queries and sorting
 - `:stored-only` - Store but don't index (for retrieval-only fields)
 - `:vector` - KNN float vector search with configurable similarity
+- `:nested` - Vector of child maps, each indexed as its own document; see [Nested Documents](#nested-documents)
 
 Auto-detection:
 - `java.time.Instant` → `:long` (epoch millis)
@@ -218,7 +219,10 @@ Auto-detection:
   (.addDocument writer doc))
 
 (sc/delete-docs writer "id" "doc-1")           ; delete by field+value
+(sc/delete-query writer lucene-query)          ; delete by a Lucene Query
 (sc/update-doc writer "id" "doc-1" new-fields) ; atomic delete+add
+(sc/add-document writer lucene-doc)            ; pre-built Lucene Document
+(sc/add-block writer [child ... root])         ; pre-built nested block
 ```
 
 ### Commit & History
@@ -283,6 +287,9 @@ Scriptum provides composable query builders so you don't need to import Lucene c
                 [(sc/text-query :body  "clojure") :should]
                 [{:term [:category "programming"]}  :filter]])
 
+;; Roots with a nested child matching a query (see Nested Documents)
+(sc/nested-query :comments {:term [:comments.author "alice"]} {:score-mode :max})
+
 ;; Pass any query to search
 (sc/search writer (sc/text-query :body "lucene") {:limit 10})
 (sc/search writer (sc/multi-field-query [:title :body] "scriptum branching") {:limit 5})
@@ -310,6 +317,73 @@ Scriptum provides composable query builders so you don't need to import Lucene c
 
 ;; Returns: [{:field1 "val" :field2 "val" :score 1.0 :doc-id 0} ...]
 ```
+
+### Nested Documents
+
+Elasticsearch-style `nested` objects, stored as Lucene block joins. Each object
+in a `:nested` field is indexed as its own child document, so the conditions of
+a nested query must all hold for the same object:
+
+```clojure
+(import '[org.apache.lucene.document IntField])
+
+(sc/add-doc writer {:id       {:value "post-1" :type :string}
+                    :title    "Nested documents"
+                    :comments {:type :nested
+                               :value [{:author {:value "alice" :type :string}
+                                        :stars  {:value 5 :type :int}}
+                                       {:author {:value "bob" :type :string}
+                                        :stars  {:value 1 :type :int}}]}})
+
+;; Posts with ONE comment by alice that has 1 star. post-1 does not match;
+;; flattened fields would match it, since alice and 1 star are in different comments.
+(sc/search writer
+  (sc/nested-query :comments
+                   (sc/bool-query [[{:term [:comments.author "alice"]} :filter]
+                                   [(IntField/newExactQuery "comments.stars" 1) :filter]])
+                   {:score-mode :max}))
+```
+
+- A child map takes the same field specs as a document. Its fields are named
+  `<path>.<field>` (`comments.author`), and child queries use those names.
+- `:score-mode` sets how the matching children's scores become the root's:
+  `:avg` (the default, as in ES), `:max`, `:min`, `:sum` or `:none`.
+- **Only roots are results.** `search`, `:all`, `search-store-snapshot`,
+  `count-store-snapshot` and `candidate-page` never return a child.
+  `nested-query` matches children but returns their roots, and a hit carries
+  the root's stored fields only: no child's values come back yet (there are no
+  inner hits). Keep whatever a result must show on the root, for example as
+  `:stored-only`.
+- **Counting.** `num-docs` and `max-doc` count Lucene documents, children
+  included, as ES's index stats do. To count roots, use
+  `(sc/count-store-snapshot snap :all)`, or count `sc/roots-query` over any
+  reader: `(.count (IndexSearcher. reader) sc/roots-query)`. `search` stops at
+  its `:limit`, so `(count (sc/search writer :all))` does not count roots.
+  `sc/roots-bitset` is the matching parents filter for your own block-join
+  queries; share that one instance, since it caches per segment.
+- **Deletes and updates act on whole blocks.** Once an index holds nested
+  documents, `delete-docs`, `delete-query` and `update-doc` match roots only,
+  and each matched root takes its children with it. A delete by a field that
+  only children carry matches nothing, and an `update-doc` keyed by one
+  replaces nothing and adds the new block. To change one comment you reindex
+  its post with `update-doc`, as in ES. An index that never used `:nested`
+  keeps the plain term-delete path. The choice is made atomically with the
+  write, so concurrent writers need no coordination while an index gets its
+  first children.
+- `add-block` adds a pre-built block of Lucene documents, children first and
+  root last. Each child carries a `_nested_path` StringField
+  (`sc/nested-path-field`) holding its path, and the root does not. A block of
+  any other shape is refused before anything is written, as is a lone child
+  passed to `add-document` and a doc-map with a top-level `_nested_path` key.
+- Existing indexes need no migration: a document without `_nested_path` is a
+  root.
+- Not supported yet: nesting inside a nested object, inner hits, and sorting
+  by a nested field.
+
+The whole-block rule exists because a root deleted without its children
+corrupts the index silently. Before a merge, nested queries still return the
+deleted root through its children. At the next merge the children join the
+following root's block, and Lucene's `CheckJoinIndex` does not detect it.
 
 ### Time Travel
 
@@ -450,8 +524,11 @@ main.close();
 | `open(path, branchName)` | Open existing branch |
 | `fork(branchName)` | Fast fork (copies metadata only) |
 | `addDocument(doc)` | Add a document |
+| `addDocuments(docs)` | Add a block atomically (nested: children first, parent last) |
 | `deleteDocuments(terms...)` | Delete by terms |
 | `updateDocument(term, doc)` | Atomic delete+add |
+| `updateDocuments(term or query, docs)` | Atomic delete+add of a block |
+| `mayHoldNested()` | Whether the branch may hold nested children (set once a block arrives) |
 | `commit()` / `commit(message)` | Persist changes |
 | `getLastCommitId()` | Get last commit's UUID (Lucene internal) |
 | `getLastContentHash()` | Get last commit's merkle root (if crypto-hash enabled) |
@@ -466,6 +543,12 @@ main.close();
 | `numDocs()` / `maxDoc()` | Document counts |
 | `getBranchName()` | Current branch name |
 | `isMainBranch()` | Check if main branch |
+
+A nested block must be deleted whole. `deleteDocuments(term)` or
+`updateDocument(term, doc)` on a parent's id removes the parent and leaves its
+children live, and after the next merge they belong to the following parent.
+To delete a parent from Java, pass `deleteDocuments(query)` the parent query OR
+a `ToChildBlockJoinQuery` over it, which is what `delete-docs` does in Clojure.
 
 ## Konserve-Backed Storage
 

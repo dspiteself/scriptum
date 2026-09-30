@@ -18,6 +18,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.index.CodecReader;
@@ -155,6 +158,12 @@ public class BranchIndexWriter implements Closeable {
   private static final String COMMIT_CRYPTO_HASH_KEY = "scriptum.crypto-hash";
   private static final String HASH_METADATA_DIR = "scriptum-hashes";
 
+  /**
+   * The field every nested (block-join) child carries, holding its path. Parents never carry it,
+   * so a document without it is a parent. scriptum.core's {@code nested-path-field}.
+   */
+  public static final String NESTED_PATH_FIELD = "_nested_path";
+
   private final IndexWriter writer;
   private final Directory directory;
   private final BranchDeletionPolicy deletionPolicy;
@@ -178,6 +187,28 @@ public class BranchIndexWriter implements Closeable {
   // Cache of segment name -> file hashes (for crypto-hash mode)
   private final Map<String, Map<String, UUID>> segmentHashCache;
 
+  /**
+   * Whether this branch may hold nested children. A LATCH: it goes false to true once and never
+   * back, so a branch whose children were all deleted stays on the block-safe path.
+   *
+   * <p>A flag, not {@code IndexWriter.getFieldNames()} per write: that call copies every field name
+   * under the writer's global field-number monitor. Measured on a flat index with 1000 distinct
+   * fields, it made each update-doc 43 us against 3.6 us, and 8 threads updating fell from 1.37M/s
+   * to 24k/s — the price of a check that exists to keep flat indexes on their old, cheap path.
+   */
+  private volatile boolean mayHoldNested;
+
+  /**
+   * Makes a flat write atomic with the answer that sent it down the flat path.
+   *
+   * <p>A term delete of a root orphans its children. Checking the latch and then writing left a
+   * window: a nested block for that root added in between was split by the delete that followed.
+   * So {@link #writeFlatOrNested} holds the read lock across check and write, and the one call that
+   * sets the latch takes the write lock to do it — it waits out every flat write already in flight,
+   * and none starts after. Once the latch is set, nothing takes this lock again.
+   */
+  private final ReentrantReadWriteLock nestedTransition = new ReentrantReadWriteLock();
+
   private BranchIndexWriter(
       IndexWriter writer,
       Directory directory,
@@ -198,6 +229,9 @@ public class BranchIndexWriter implements Closeable {
     this.isMainBranch = isMainBranch;
     this.cryptoHash = cryptoHash;
     this.segmentHashCache = cryptoHash ? new java.util.concurrent.ConcurrentHashMap<>() : null;
+    // Every open, fork and store-backed open comes through here, and a fresh IndexWriter's field
+    // names are those of the commit it opened on — so this one read covers them all.
+    this.mayHoldNested = writer.getFieldNames().contains(NESTED_PATH_FIELD);
   }
 
   /** Initialize lastCommitId from the latest existing commit's UUID. */
@@ -756,7 +790,87 @@ public class BranchIndexWriter implements Closeable {
   }
 
   /**
+   * Add a block of documents atomically, with sequentially assigned doc ids.
+   *
+   * <p>THE BLOCK-JOIN CONTRACT: children first, parent LAST, all in ONE call. Lucene's block joins
+   * find a child's parent as the next parent doc id after it, and only a single {@code
+   * addDocuments} call guarantees the block is contiguous — no concurrent add can land inside it,
+   * and a flush never splits it across segments. Adding the same documents one at a time gives no
+   * such guarantee. Each child carries {@link #NESTED_PATH_FIELD}; the parent does not.
+   *
+   * <p>A BLOCK IS DELETED WHOLE OR NOT AT ALL. {@link #deleteDocuments(Term...)} or {@link
+   * #updateDocument} on a parent's id removes the parent and leaves its children live: block-join
+   * queries then return the deleted parent through them, and after the next merge they silently
+   * belong to the following parent. Delete a parent with {@link #deleteDocuments(Query...)} over
+   * the parent query OR a {@code ToChildBlockJoinQuery} of it, as scriptum.core's {@code
+   * delete-docs} does.
+   *
+   * <p>Sets {@link #mayHoldNested()} first, since this is how children arrive.
+   *
+   * @param docs the block: child documents followed by their parent
+   * @return the sequence number for this operation
+   */
+  public long addDocuments(Iterable<? extends Iterable<? extends IndexableField>> docs)
+      throws IOException {
+    markNested();
+    return writer.addDocuments(docs);
+  }
+
+  /**
+   * Whether this branch may hold nested children: true once a block has been added or merged in,
+   * or the branch was opened on a commit holding one. A volatile read.
+   */
+  public boolean mayHoldNested() {
+    return mayHoldNested;
+  }
+
+  /** Set the latch, waiting out every flat write already in flight; see {@link #nestedTransition}. */
+  private void markNested() {
+    if (!mayHoldNested) {
+      Lock lock = nestedTransition.writeLock();
+      lock.lock();
+      try {
+        mayHoldNested = true;
+      } finally {
+        lock.unlock();
+      }
+    }
+  }
+
+  /**
+   * Run {@code flatWrite} if this branch holds no nested children, atomically with that answer,
+   * and {@code nestedWrite} otherwise.
+   *
+   * <p>For a write whose plain form orphans children on a nested branch — a term delete or update
+   * of a parent — but which a flat branch should keep, because a buffered term delete costs less
+   * than the query delete that takes a block whole. No block can be added between the check and
+   * {@code flatWrite}; see {@link #nestedTransition}. Once the latch is set this is one volatile
+   * read and {@code nestedWrite}.
+   *
+   * <p>{@code flatWrite} runs under a read lock that adding a block needs to take for writing, so it
+   * must not add a block itself.
+   *
+   * @return what the write that ran returned
+   */
+  public <T> T writeFlatOrNested(Callable<T> flatWrite, Callable<T> nestedWrite) throws Exception {
+    if (!mayHoldNested) {
+      Lock lock = nestedTransition.readLock();
+      lock.lock();
+      try {
+        if (!mayHoldNested) {
+          return flatWrite.call();
+        }
+      } finally {
+        lock.unlock();
+      }
+    }
+    return nestedWrite.call();
+  }
+
+  /**
    * Delete documents matching the given terms.
+   *
+   * <p>Deleting a nested parent this way orphans its children; see {@link #addDocuments}.
    *
    * @param terms the terms identifying documents to delete
    * @return the sequence number for this operation
@@ -778,12 +892,51 @@ public class BranchIndexWriter implements Closeable {
   /**
    * Update a document identified by the given term.
    *
+   * <p>Updating a nested parent this way orphans its old children; see {@link #addDocuments}.
+   *
    * @param term the term identifying the document to update
    * @param doc the new document
    * @return the sequence number for this operation
    */
   public long updateDocument(Term term, Iterable<? extends IndexableField> doc) throws IOException {
     return writer.updateDocument(term, doc);
+  }
+
+  /**
+   * Atomically delete documents matching {@code term} and add a block in their place.
+   *
+   * <p>Same block contract as {@link #addDocuments}: children first, parent last, one call. The
+   * delete removes only what {@code term} matches, so replacing an existing block this way is safe
+   * only if every document of the old block carries the term; otherwise use {@link
+   * #updateDocuments(Query, Iterable)} with a query that reaches the old children. Sets {@link
+   * #mayHoldNested()} first, as {@link #addDocuments} does.
+   *
+   * @param term the term identifying the documents to replace
+   * @param docs the new block: child documents followed by their parent
+   * @return the sequence number for this operation
+   */
+  public long updateDocuments(
+      Term term, Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
+    markNested();
+    return writer.updateDocuments(term, docs);
+  }
+
+  /**
+   * Atomically delete documents matching {@code query} and add a block in their place.
+   *
+   * <p>Same block contract as {@link #addDocuments}. The query form exists so a caller can delete
+   * an old parent together with its children — a block-join query reaches children no term on them
+   * identifies — and add the replacement in the same atomic step. Sets {@link #mayHoldNested()}
+   * first, as {@link #addDocuments} does.
+   *
+   * @param query the query identifying the documents to replace
+   * @param docs the new block: child documents followed by their parent
+   * @return the sequence number for this operation
+   */
+  public long updateDocuments(
+      Query query, Iterable<? extends Iterable<? extends IndexableField>> docs) throws IOException {
+    markNested();
+    return writer.updateDocuments(query, docs);
   }
 
   /**
@@ -1392,8 +1545,15 @@ public class BranchIndexWriter implements Closeable {
     commit("Pre-merge snapshot");
     try (DirectoryReader reader = DirectoryReader.open(source.directory)) {
       List<CodecReader> codecReaders = new ArrayList<>();
+      boolean nested = false;
       for (LeafReaderContext ctx : reader.leaves()) {
         codecReaders.add((CodecReader) ctx.reader());
+        nested |= ctx.reader().getFieldInfos().fieldInfo(NESTED_PATH_FIELD) != null;
+      }
+      // Blocks arriving this way make this branch nested just as addDocuments does, and the latch
+      // must be set BEFORE they land, for the same reason.
+      if (nested) {
+        markNested();
       }
       writer.addIndexes(codecReaders.toArray(new CodecReader[0]));
     }
