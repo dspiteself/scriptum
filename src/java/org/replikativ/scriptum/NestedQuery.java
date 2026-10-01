@@ -1,12 +1,20 @@
 package org.replikativ.scriptum;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.PostingsEnum;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
@@ -19,10 +27,13 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.join.BitSetProducer;
+import org.apache.lucene.search.join.ParentChildrenBlockJoinQuery;
 import org.apache.lucene.search.join.QueryBitSetProducer;
 import org.apache.lucene.search.join.ScoreMode;
 import org.apache.lucene.search.join.ToChildBlockJoinQuery;
 import org.apache.lucene.search.join.ToParentBlockJoinQuery;
+import org.apache.lucene.util.BitSet;
+import org.apache.lucene.util.BytesRef;
 
 /**
  * Elasticsearch's {@code nested} query over scriptum's block joins: matches the documents on
@@ -50,13 +61,20 @@ import org.apache.lucene.search.join.ToParentBlockJoinQuery;
  * on {@code "a"} joins each c to its own a, and a top-level query on {@code "comments.replies"}
  * joins each reply straight to its root.
  *
- * <p>BINDING NEVER GUESSES. Binding walks the query types whose clauses keep their meaning when
- * rebuilt ({@code BooleanQuery}, {@code BoostQuery}, {@code ConstantScoreQuery} and {@code
- * DisjunctionMaxQuery}), and refuses a nested query it finds through any other type rather than
- * leave it joined to the wrong level. One it cannot see at all, inside a query whose {@code visit}
- * hides its subqueries, keeps its own binding; a nested query left joined to the roots then
- * matches only roots, which the enclosing level's path filter ({@link #childLevelQuery()})
- * excludes, so it finds nothing rather than the wrong documents.
+ * <p>BINDING NEVER GUESSES, BUT IT SEES ONLY WHAT {@link Query#visit} SHOWS. Binding walks the
+ * query types whose clauses keep their meaning when rebuilt ({@code BooleanQuery}, {@code
+ * BoostQuery}, {@code ConstantScoreQuery} and {@code DisjunctionMaxQuery}), and refuses a nested
+ * query it finds through any other type rather than leave it joined to the wrong level. It finds
+ * them through {@code visit}, and looks inside Lucene's {@code ToParentBlockJoinQuery} and {@code
+ * ToChildBlockJoinQuery} itself, since those visit as leaves. Lucene's {@code
+ * ParentChildrenBlockJoinQuery} also visits as a leaf and gives no access to its child query, so
+ * it is refused outright; it has no use inside a nested query. A query whose {@code visit} hides
+ * its subqueries cannot be checked at all, the ones Lucene's {@code JoinUtil} builds among them. A
+ * nested query inside one keeps its own binding: joined to the roots, it matches no document at
+ * the enclosing level, whose path filter ({@link #childLevelQuery()}) excludes roots. Under a
+ * positive clause that finds nothing. Under MUST_NOT it excludes nothing, so the enclosing query
+ * matches as if that condition were absent: WRONG documents, with no error. Keep nested queries
+ * out of such wrappers.
  *
  * <p>INNER HITS. A nested query may carry an inner-hits request ({@link #getInnerHits()}), which
  * changes nothing about what it matches. {@link #innerHitsOf(Query)} finds the requests in a
@@ -81,12 +99,17 @@ public final class NestedQuery extends Query {
   private static final QueryBitSetProducer ROOTS_FILTER = new QueryBitSetProducer(ROOTS_QUERY);
 
   /**
-   * One parents filter per path, SHARED, because {@code QueryBitSetProducer} caches its bitset per
-   * segment core: a fresh producer per query would recompute it on every search. Paths come from a
-   * schema, so this stays as small as the set of nested fields.
+   * Per segment core, the documents on each path that has any there: the cache behind every {@link
+   * PathFilter}. ONE CACHE FOR ALL PRODUCERS, keyed by core rather than held by a producer per path.
+   * A shared {@code QueryBitSetProducer} per path needed a registry that grew with every distinct
+   * path a caller ever sent, sort paths and inner-hits paths included, and its weak per-core map let
+   * go of a closed segment's bitset only when that producer next ran. Here an entry goes when its
+   * core closes, the weak key covering a core that closed before its listener was added, and a path
+   * with no documents in a segment is never stored. So this holds the open segments' bitsets for
+   * the paths they have, and nothing for the rest.
    */
-  private static final ConcurrentMap<String, QueryBitSetProducer> PATH_FILTERS =
-      new ConcurrentHashMap<>();
+  private static final Map<IndexReader.CacheKey, Map<String, BitSet>> PATH_BITSETS =
+      Collections.synchronizedMap(new WeakHashMap<>());
 
   private final String path;
   private final Query childQuery;
@@ -116,8 +139,11 @@ public final class NestedQuery extends Query {
    *     "comments.author"})
    * @param scoreMode how matching children's scores become the parent's
    * @param parentPath the parents' path, which {@code path} must be under; null for the roots
-   * @param innerHits null for none; otherwise an inner-hits request, which scriptum.core reads
-   *     (true or an options map). Opaque to this class: carried through binding, compared by equals
+   * @param innerHits null for none; otherwise an inner-hits request, which scriptum.core reads:
+   *     {@code Boolean.TRUE}, or a Clojure map with the keyword keys {@code :name}, {@code :size}
+   *     and {@code :fields}, as scriptum.core's {@code nested-query} builds it. A {@code
+   *     java.util.Map} is refused when a search reads it. Opaque to this class: carried through
+   *     binding, compared by equals
    * @throws IllegalArgumentException if a path is malformed, {@code parentPath} is not above {@code
    *     path}, or a contained nested query is not under {@code path} or cannot be bound
    */
@@ -171,17 +197,95 @@ public final class NestedQuery extends Query {
 
   /**
    * The parents filter for the documents on {@code parentPath}, or {@link #rootsFilter()} when it
-   * is null. One shared instance per path, so per-segment bitsets are computed once.
+   * is null. Equal for equal paths, so queries and sorts built on it are equal too. Whichever
+   * instance asks, a segment's bitset for a path is computed once and dropped when the segment's
+   * core closes.
    *
    * @throws IllegalArgumentException if {@code parentPath} is malformed
    */
   public static BitSetProducer parentFilter(String parentPath) {
-    if (parentPath == null) {
-      return ROOTS_FILTER;
+    return parentPath == null ? ROOTS_FILTER : new PathFilter(checkPath(parentPath));
+  }
+
+  /**
+   * The documents on one path, the parents filter of a join to that path's objects; see {@link
+   * #PATH_BITSETS} for where its bitsets live. Like a {@code QueryBitSetProducer}, it reads every
+   * document, deleted ones included, so a block's range stays its own until a merge drops it.
+   */
+  private static final class PathFilter implements BitSetProducer {
+    private final String path;
+
+    PathFilter(String path) {
+      this.path = path;
     }
-    return PATH_FILTERS.computeIfAbsent(
-        checkPath(parentPath),
-        p -> new QueryBitSetProducer(new TermQuery(new Term(PATH_FIELD, p))));
+
+    @Override
+    public BitSet getBitSet(LeafReaderContext context) throws IOException {
+      LeafReader reader = context.reader();
+      IndexReader.CacheHelper core = reader.getCoreCacheHelper();
+      Map<String, BitSet> cached = core == null ? null : PATH_BITSETS.get(core.getKey());
+      BitSet bits = cached == null ? null : cached.get(path);
+      if (bits == null) {
+        bits = documentsOn(reader);
+        if (bits != null && core != null) {
+          BitSet raced = cacheOf(core).putIfAbsent(path, bits);
+          bits = raced == null ? bits : raced;
+        }
+      }
+      return bits;
+    }
+
+    /** null when no document in {@code reader} is on the path, the cheap case left uncached. */
+    private BitSet documentsOn(LeafReader reader) throws IOException {
+      Terms terms = reader.terms(PATH_FIELD);
+      if (terms == null) {
+        return null;
+      }
+      TermsEnum termsEnum = terms.iterator();
+      if (!termsEnum.seekExact(new BytesRef(path))) {
+        return null;
+      }
+      return BitSet.of(termsEnum.postings(null, PostingsEnum.NONE), reader.maxDoc());
+    }
+
+    /**
+     * {@code core}'s map of paths to bitsets, made on first use. The closed listener is added
+     * OUTSIDE the cache's lock: a core runs its listeners under the lock of its listener set, and
+     * the listener takes the cache's lock, so adding it inside would let a closing core deadlock
+     * against a search.
+     */
+    private static Map<String, BitSet> cacheOf(IndexReader.CacheHelper core) {
+      IndexReader.CacheKey key = core.getKey();
+      Map<String, BitSet> cache;
+      boolean made = false;
+      synchronized (PATH_BITSETS) {
+        cache = PATH_BITSETS.get(key);
+        if (cache == null) {
+          cache = new ConcurrentHashMap<>();
+          PATH_BITSETS.put(key, cache);
+          made = true;
+        }
+      }
+      if (made) {
+        core.addClosedListener(PATH_BITSETS::remove);
+      }
+      return cache;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      return other instanceof PathFilter that && path.equals(that.path);
+    }
+
+    @Override
+    public int hashCode() {
+      return 31 * PathFilter.class.hashCode() + path.hashCode();
+    }
+
+    @Override
+    public String toString() {
+      return "PathFilter(" + PATH_FIELD + ":" + path + ")";
+    }
   }
 
   /** Whether {@code path} is one or more non-empty field names joined by dots. */
@@ -263,7 +367,19 @@ public final class NestedQuery extends Query {
           ? new DisjunctionMaxQuery(disjuncts, disMax.getTieBreakerMultiplier())
           : disMax;
     }
-    if (hidesNested(query)) {
+    NestedFinder finder = new NestedFinder();
+    query.visit(finder);
+    if (finder.hiding != null) {
+      throw new IllegalArgumentException(
+          "a ParentChildrenBlockJoinQuery inside the nested query on \""
+              + path
+              + "\" hides its child query from binding, which cannot tell whether a nested query"
+              + " in it should join to \""
+              + path
+              + "\"; it has no use inside a nested query: "
+              + finder.hiding);
+    }
+    if (finder.found) {
       throw new IllegalArgumentException(
           "a nested query inside the nested query on \""
               + path
@@ -294,22 +410,18 @@ public final class NestedQuery extends Query {
     return new NestedQuery(path, childQuery, scoreMode, newParentPath, innerHits, null);
   }
 
-  /** Whether a nested query is reachable from {@code query} by way of {@link Query#visit}. */
-  private static boolean hidesNested(Query query) {
-    NestedFinder finder = new NestedFinder();
-    query.visit(finder);
-    return finder.found;
-  }
-
   /**
-   * Finds a NestedQuery anywhere under the visited query.
+   * Finds a NestedQuery anywhere under the visited query, and a ParentChildrenBlockJoinQuery, which
+   * could hide one.
    *
    * <p>Overrides two defaults that would hide one: {@code getSubVisitor} normally skips MUST_NOT
    * clauses, and a nested query is bound the same under one; and Lucene's block-join queries only
-   * report themselves as leaves, so their inner query is visited here explicitly.
+   * report themselves as leaves, so their inner query is visited here explicitly where they expose
+   * it.
    */
   private static final class NestedFinder extends QueryVisitor {
     boolean found;
+    Query hiding;
 
     @Override
     public QueryVisitor getSubVisitor(BooleanClause.Occur occur, Query parent) {
@@ -327,6 +439,8 @@ public final class NestedQuery extends Query {
         join.getChildQuery().visit(this);
       } else if (query instanceof ToChildBlockJoinQuery join) {
         join.getParentQuery().visit(this);
+      } else if (query instanceof ParentChildrenBlockJoinQuery) {
+        hiding = query;
       }
     }
   }

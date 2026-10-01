@@ -23,8 +23,8 @@
             IntField LongField FloatField DoubleField StoredField
             KnnFloatVectorField]
            [org.apache.lucene.index DirectoryReader DocValuesType FieldInfo IndexReader
-            IndexableField LeafReaderContext PostingsEnum ReaderUtil StoredFields Term
-            VectorSimilarityFunction]
+            IndexableField IndexableFieldType LeafReaderContext PostingsEnum ReaderUtil
+            StoredFields Term VectorSimilarityFunction]
            [org.apache.lucene.search IndexSearcher Query TermQuery TermInSetQuery PrefixQuery ConstantScoreQuery BooleanQuery
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
             FieldDoc Sort SortField SortField$Type SortedNumericSelector$Type
@@ -678,8 +678,9 @@
 
   ONE SHARED INSTANCE, `NestedQuery/rootsFilter`, because `QueryBitSetProducer`
   caches its bitset per segment core; a fresh producer per query would
-  recompute it on every search. `NestedQuery/parentFilter` gives the same for
-  the documents on one path."
+  recompute it on every search. `NestedQuery/parentFilter` is the filter for
+  the documents on one path, its bitsets cached per segment for every
+  instance alike."
   (NestedQuery/rootsFilter))
 
 (defn- block-delete-query
@@ -729,14 +730,36 @@
                     {:field nested-path-field})))
   (.addDocument ^BranchIndexWriter (->writer sw) doc))
 
+(defn- string-field-type?
+  "Whether `t` indexes a value as StringField does, stored or not.
+
+  THE ONE SCHEMA `nested-path-field` MAY HAVE. Lucene fixes a field's schema
+  the first time the field is written and refuses any other afterwards, so a
+  path held in a TextField, a KeywordField or a custom type would make every
+  later `add-doc` with `:nested` on the branch, and on its forks, throw. A
+  stored-only one is not indexed at all, so its child reads as a root, and a
+  TextField lowercases the path, so `nested-query` on \"Comments\" misses it."
+  [^IndexableFieldType t]
+  (let [^IndexableFieldType s StringField/TYPE_NOT_STORED]
+    (and (= (.indexOptions s) (.indexOptions t))
+         (= (.tokenized s) (.tokenized t))
+         (= (.omitNorms s) (.omitNorms t))
+         (= (.storeTermVectors s) (.storeTermVectors t))
+         (= (.docValuesType s) (.docValuesType t))
+         (= (.docValuesSkipIndexType s) (.docValuesSkipIndexType t))
+         (= (.pointDimensionCount s) (.pointDimensionCount t))
+         (= (.vectorDimension s) (.vectorDimension t)))))
+
 (defn- nested-path-of
   "`doc`'s `nested-path-field` value: nil for a root, and ::malformed for a
-  document carrying the field more than once or without a string value."
+  document carrying the field more than once, without a string value, or as
+  anything but a StringField."
   [^Iterable doc]
   (reduce (fn [path ^IndexableField field]
             (cond
               (not= nested-path-field (.name field)) path
               (some? path) (reduced ::malformed)
+              (not (string-field-type? (.fieldType field))) (reduced ::malformed)
               :else (or (.stringValue field) ::malformed)))
           nil
           doc))
@@ -784,11 +807,11 @@
 
   The typed counterpart of `add-document` for nested documents. The block goes
   in ONE `addDocuments` call, so it is contiguous and atomic. Every child
-  carries `nested-path-field` (a StringField holding its path), and the root,
-  last, does not. A child with children of its own comes right after them, so
-  the block is its root's tree in post-order, as `add-doc` writes it:
-  `[reply reply comment reply comment root]`, the replies on
-  \"comments.replies\" and the comments on \"comments\".
+  carries `nested-path-field` once, as a StringField (stored or not) holding
+  its path, and the root, last, does not. A child with children of its own
+  comes right after them, so the block is its root's tree in post-order, as
+  `add-doc` writes it: `[reply reply comment reply comment root]`, the
+  replies on \"comments.replies\" and the comments on \"comments\".
 
   ANY OTHER SHAPE IS REFUSED BEFORE ANYTHING IS WRITTEN, because Lucene would
   accept it and nothing would report it. A child missing the field is a root to
@@ -797,7 +820,13 @@
   join the next root written, whoever's that is. A child whose parent does not
   follow it, before any other of its ancestors' documents, joins some other
   object's parent: a reply written after its comment belongs to the NEXT
-  comment, in this block or a later one."
+  comment, in this block or a later one. A path in anything but a StringField
+  is refused too: stored only, it is not indexed and its child is a root;
+  indexed any other way, it fixes the field's schema so that every later
+  nested write on the branch throws.
+
+  Name a child's fields under its path, `<path>.<name>`, as `add-doc` does; a
+  nested sort reads only fields named so."
   [sw docs]
   (let [docs (vec docs)
         paths (mapv nested-path-of docs)]
@@ -805,8 +834,8 @@
                    (nil? (peek paths))
                    (every? #(and (string? %) (NestedQuery/isValidPath %)) (pop paths)))
       (throw (ex-info (str "scriptum: a block is its children, each carrying "
-                           nested-path-field " (field names joined by \".\"), "
-                           "then one root without it")
+                           nested-path-field " once, as a StringField holding its path"
+                           " (field names joined by \".\"), then one root without it")
                       {:shape (mapv #(if (some? %) :child :root) paths)
                        :paths paths})))
     (when-let [i (misplaced-child paths)]
@@ -1527,8 +1556,14 @@
   under any comment. The inner path may skip levels (\"a.b.c\" inside \"a\").
   It must be under the enclosing path, and the inner query must sit in the
   enclosing one's child query only through bool, boost, constant-score or
-  dis-max queries, which are rebuilt around the rebound inner query; anything
-  else throws IllegalArgumentException rather than join it to the wrong level.
+  dis-max queries, which are rebuilt around the rebound inner query. Found
+  through any other query, it throws IllegalArgumentException rather than join
+  it to the wrong level. Binding finds it through Query.visit, so a query whose
+  visit hides its subqueries cannot be checked: a nested query in one stays
+  joined to the roots and matches nothing at the inner level, so under
+  :must-not it excludes nothing and the results are WRONG. Keep nested queries
+  out of such queries. Lucene's ParentChildrenBlockJoinQuery is one, and is
+  refused inside a nested query.
 
   INNER HITS. With :inner-hits, `search` and `search-store-snapshot` also
   return, on each hit, the children that matched this query; `search` shows
@@ -1620,18 +1655,22 @@
   "The children a sort's `:nested` spec reads, the documents on its :path that
   match its :filter, as the child filter ToParentBlockJoinSortField takes.
 
-  Without a :filter it is the path's SHARED `NestedQuery/parentFilter`, whose
-  bitsets are computed once per segment. With one it is a FRESH producer per
-  search. Its cache is keyed by segment core and lives as long as the producer,
-  which is this search, so nothing accumulates however many distinct filters
-  callers send; the cost is the filter's bitset per segment per search, about
-  what running the filter costs. Sharing a producer per filter would need a
+  Without a :filter it is the path's `NestedQuery/parentFilter`, whose bitsets
+  are computed once per segment for every search. With one it is a FRESH
+  producer per search. Its cache is keyed by segment core and lives as long as
+  the producer, which is this search, so nothing accumulates however many
+  distinct filters callers send; the cost is the filter's bitset per segment
+  per search, about what running the filter costs. Sharing a producer per filter would need a
   cache keyed by callers' queries, which grows without bound.
 
   The filter is a child-level query, as in `nested-query`: over the children's
   full field names, with nested queries inside it joined to the path's
-  objects, by the same binding and with the same errors."
-  ^BitSetProducer [nested]
+  objects, by the same binding and with the same errors.
+
+  `field` must be named under the path, as a child's fields are: one that is
+  not, such as \"stars\" for \"comments.stars\", is on none of the path's
+  objects, and every root would sort as missing without a word."
+  ^BitSetProducer [nested ^String field]
   (when-not (map? nested)
     (throw (ex-info "scriptum: a sort's :nested is a map of :path and :filter"
                     {:nested nested})))
@@ -1643,6 +1682,10 @@
     (when-not (NestedQuery/isValidPath path)
       (throw (ex-info "scriptum: a sort's :nested :path is non-empty field names joined by \".\""
                       {:nested nested})))
+    (when-not (.startsWith field (str path "."))
+      (throw (ex-info (str "scriptum: a nested sort's :field is a field of the :path objects,"
+                           " named under the path: \"" path ".<name>\", not \"" field "\"")
+                      {:field field :path path})))
     (if (nil? filter)
       (NestedQuery/parentFilter path)
       (QueryBitSetProducer.
@@ -1696,7 +1739,7 @@
                ;; BlockJoinSelector MAX when it is true and MIN when false.
                (ToParentBlockJoinSortField. ^String field lucene-type (boolean reverse?)
                                             (= :max mode) (NestedQuery/rootsFilter)
-                                            (nested-sort-children nested)))]
+                                            (nested-sort-children nested field)))]
       (.setMissingValue ^SortField sf (missing-value type missing reverse?))
       {:sort-field sf :field field :type type})))
 
@@ -1885,16 +1928,26 @@
 (defn- inner-hits
   "The `:inner-hits` of `doc`, a hit among the documents `parents` marks (the
   roots for a top-level hit): for each request, its matching children of
-  `doc`, best first, and how many there are.
+  `doc`, best first, and how many there are. `sf` reads their stored fields.
 
   `doc`'s range is every document between the previous one `parents` marks
   and it, which a request's own path filter narrows to its level. The
   children of each child hit are found the same way, with the documents on
-  the child's path as the parents."
-  [^IndexSearcher searcher requests ^BitSetProducer parents doc]
-  (let [reader (.getIndexReader searcher)
-        leaves (.leaves reader)
-        sf (.storedFields searcher)
+  the child's path as the parents.
+
+  THE RANGE SIZES THE COLLECTOR, since no request can match more of it. A
+  TopScoreDocCollector fills its whole heap before it collects, so one sized
+  by :size or by the index costs time and memory with those, not with the
+  block; and an empty range needs no search at all."
+  [^IndexSearcher searcher ^StoredFields sf requests ^BitSetProducer parents doc]
+  (let [leaves (.leaves (.getIndexReader searcher))
+        ^LeafReaderContext leaf (.get leaves (ReaderUtil/subIndex (int doc) leaves))
+        local (- (long doc) (.-docBase leaf))
+        ;; As ParentChildrenBlockJoinQuery finds it: after the previous parent.
+        ^BitSet parent-docs (.getBitSet parents leaf)
+        block-size (if (and parent-docs (pos? local))
+                     (- local (inc (.prevSetBit parent-docs (int (dec local)))))
+                     0)
         child-hit (fn [{:keys [path children]} keep? ^ScoreDoc sd]
                     (let [child (.-doc sd)
                           ^LeafReaderContext ctx (.get leaves (ReaderUtil/subIndex child leaves))
@@ -1906,23 +1959,24 @@
                                      :offset (peek offsets)
                                      :path-offsets offsets)
                         (seq children)
-                        (assoc :inner-hits (inner-hits searcher children
+                        (assoc :inner-hits (inner-hits searcher sf children
                                                        (NestedQuery/parentFilter path) child)))))]
     (into {}
           (map (fn [{:keys [name size fields query] :as request}]
-                 (let [q (ParentChildrenBlockJoinQuery. parents ^Query query (int doc))
-                       ;; A collector sized past the index would allocate for
-                       ;; nothing, and one of size 0 is refused, so count then.
-                       n (min (long size) (.maxDoc reader))
-                       ;; An unbounded threshold makes the total exact, past
-                       ;; the 1000 at which Lucene would stop counting.
-                       ^TopDocs top (when (pos? n)
-                                      (.search searcher q (TopScoreDocCollectorManager.
-                                                           (int n) Integer/MAX_VALUE)))
-                       keep? (field-filter fields)]
-                   [name {:total (if top (.value (.-totalHits top)) (long (.count searcher q)))
-                          :hits (mapv #(child-hit request keep? %)
-                                      (when top (.-scoreDocs top)))}])))
+                 (if (zero? block-size)
+                   [name {:total 0 :hits []}]
+                   (let [q (ParentChildrenBlockJoinQuery. parents ^Query query (int doc))
+                         ;; A collector of size 0 is refused, so count then.
+                         n (min (long size) block-size)
+                         ;; An unbounded threshold makes the total exact, past
+                         ;; the 1000 at which Lucene would stop counting.
+                         ^TopDocs top (when (pos? n)
+                                        (.search searcher q (TopScoreDocCollectorManager.
+                                                             (int n) Integer/MAX_VALUE)))
+                         keep? (field-filter fields)]
+                     [name {:total (if top (.value (.-totalHits top)) (long (.count searcher q)))
+                            :hits (mapv #(child-hit request keep? %)
+                                        (when top (.-scoreDocs top)))}]))))
           requests)))
 
 (defn- with-inner-hits
@@ -1930,8 +1984,9 @@
   any; otherwise `results` itself, untouched."
   [^IndexSearcher searcher requests results]
   (if (seq requests)
-    (mapv #(assoc % :inner-hits (inner-hits searcher requests roots-bitset (:doc-id %)))
-          results)
+    (let [sf (.storedFields searcher)]
+      (mapv #(assoc % :inner-hits (inner-hits searcher sf requests roots-bitset (:doc-id %)))
+            results))
     results))
 
 (defn search
@@ -1969,9 +2024,12 @@
   of that query's hits, on each child hit's own :inner-hits, as in ES. Inside
   one WITHOUT a request, it is answered at the nearest level that has one, or
   at the top: its hits are the matching children whose ancestors match each
-  nested query in between, the objects through which the hit matched. A
-  request under a :must-not clause is not answered, as in ES. Without
-  requests the results are exactly what they would be otherwise.
+  nested query in between, the objects through which the hit matched. ES
+  ignores such a request instead, so here it adds keys ES would not return,
+  and two of one name landing on one level are refused where ES runs the
+  query: give each a distinct :name, or put :inner-hits on the enclosing
+  query. A request under a :must-not clause is not answered, as in ES.
+  Without requests the results are exactly what they would be otherwise.
 
   SORT. Results come best score first, then in index order, unless :sort
   names an order: a vector of specs, each breaking the ties of the one before
@@ -2004,6 +2062,15 @@
   `nested-query`: over the children's full field names, with nested queries
   in it joined to the path's objects. Without :nested a spec reads the root's
   own field, so one only children carry leaves every root without a value.
+
+  :field is named under :path (\"comments.stars\"), and a field that is not
+  is refused. A field of objects further down needs THEIR :path: under :path
+  \"comments\", \"comments.replies.stars\" is read on the comments, which
+  do not have it. That is not refused, since a dotted name may also be a
+  comment's own field.
+  Not supported: ES's per-level filters (`nested.nested`), :max-children and
+  a numeric :missing, which are refused, and an ascending :score. A deep
+  :path without per-level filters reads all of its objects under each root.
 
   A sorted result also has :sort-values, its value for each spec in order:
   the score as a Float, the doc id as an Integer, and a field's value as the

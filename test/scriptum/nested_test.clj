@@ -22,16 +22,16 @@
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
            [java.time Instant]
-           [org.apache.lucene.document Document Field$Store IntField LongField
-            StringField]
-           [org.apache.lucene.index IndexReader LeafReader LeafReaderContext
-            PostingsEnum Term Terms TermsEnum]
-           [org.apache.lucene.search BoostQuery ConstantScoreQuery DisjunctionMaxQuery
-            DocIdSetIterator IndexOrDocValuesQuery IndexSearcher MatchAllDocsQuery
-            Query TermQuery]
-           [org.apache.lucene.search.join CheckJoinIndex ScoreMode ToChildBlockJoinQuery
-            ToParentBlockJoinQuery]
-           [org.apache.lucene.util Bits BytesRef]
+           [org.apache.lucene.document Document Field Field$Store FieldType IntField
+            KeywordField LongField StoredField StringField TextField]
+           [org.apache.lucene.index IndexOptions IndexReader IndexableField LeafReader
+            LeafReaderContext PostingsEnum Term Terms TermsEnum]
+           [org.apache.lucene.search BooleanClause$Occur BooleanQuery$Builder BoostQuery
+            ConstantScoreQuery DisjunctionMaxQuery DocIdSetIterator IndexOrDocValuesQuery
+            IndexSearcher MatchAllDocsQuery Query TermQuery]
+           [org.apache.lucene.search.join CheckJoinIndex ParentChildrenBlockJoinQuery
+            ScoreMode ToChildBlockJoinQuery ToParentBlockJoinQuery]
+           [org.apache.lucene.util BitSet Bits BytesRef]
            [org.replikativ.scriptum BranchIndexWriter NestedQuery]))
 
 (def ^:dynamic *root* nil)
@@ -1063,6 +1063,52 @@
         (is (= ["r2"] (search-ids w :all)))
         (finally (sc/close! w))))))
 
+(deftest a-block-path-is-a-string-field
+  (testing "REGRESSION: add-block took a path in a field of any type. Stored
+            only, it was not indexed and its child read as a root; indexed any
+            other way, the first block fixed the field's schema, and every later
+            add-doc with :nested on the branch, and on its forks, threw"
+    (let [w (sc/create-index (under "idx") "main")
+          with-path (fn [^IndexableField path-field ^String author]
+                      (doto (Document.)
+                        (.add path-field)
+                        (.add (StringField. "comments.author" author Field$Store/YES))))
+          type-of (fn [f] (doto (FieldType. StringField/TYPE_NOT_STORED) f (.freeze)))
+          path "comments"]
+      (try
+        (doseq [[label field]
+                [["stored only" (StoredField. ^String sc/nested-path-field path)]
+                 ["a TextField" (TextField. ^String sc/nested-path-field path Field$Store/NO)]
+                 ["a TextField, whose analyzer would lowercase the path"
+                  (TextField. ^String sc/nested-path-field "Comments" Field$Store/NO)]
+                 ["a KeywordField, which adds doc values"
+                  (KeywordField. ^String sc/nested-path-field path Field$Store/NO)]
+                 ["a custom type indexing frequencies"
+                  (Field. ^String sc/nested-path-field path
+                          ^FieldType (type-of #(.setIndexOptions ^FieldType %
+                                                                 IndexOptions/DOCS_AND_FREQS)))]
+                 ["a custom type with norms"
+                  (Field. ^String sc/nested-path-field path
+                          ^FieldType (type-of #(.setOmitNorms ^FieldType % false)))]]]
+          (testing label
+            (is (thrown-with-msg? ExceptionInfo #"StringField"
+                                  (sc/add-block w [(with-path field "mallory")
+                                                   (prebuilt-root "r1")])))))
+        (is (not (latched? w)) "refused before the writer saw a document")
+        (testing "a StringField, stored or not, is the path"
+          (let [stored (StringField. ^String sc/nested-path-field path Field$Store/YES)]
+            (sc/add-block w [(with-path stored "alice") (prebuilt-root "b1")]))
+          (sc/add-block w [(prebuilt-child "bob") (prebuilt-root "b2")]))
+        (sc/add-doc w (post "p1" "one" [["carol" 2]]))
+        (sc/commit! w)
+        (assert-writer-blocks-intact w)
+        (is (= 6 (sc/num-docs w)) "b1, b2 and p1 with a child each: nothing refused was written")
+        (is (= ["b1" "b2" "p1"] (search-ids w :all)))
+        (is (= [] (search-ids w (sc/nested-query :comments {:term [:comments.author "mallory"]}))))
+        (is (= ["p1"] (search-ids w (sc/nested-query :comments {:term [:comments.author "carol"]})))
+            "add-doc still writes children")
+        (finally (sc/close! w))))))
+
 ;; =============================================================================
 ;; Nested objects inside nested objects
 ;; =============================================================================
@@ -1255,6 +1301,16 @@
                                     [[{:term [:a.b.name "b2"]} :filter]
                                      [(sc/nested-query :a.b.c {:term [:a.b.c.v "x"]})
                                       :filter]]))))))
+      (testing "an enclosing nested query overrides a binding the inner one
+                already has, as one reused from another nested query has"
+        (let [pre-bound (NestedQuery. "a.b.c" (TermQuery. (Term. "a.b.c.v" "x")) ScoreMode/Avg
+                                      "a" nil)
+              b-level (sc/nested-query :a.b (sc/bool-query [[{:term [:a.b.name "b1"]} :filter]
+                                                            [pre-bound :filter]]))
+              q (sc/nested-query :a b-level)]
+          (is (= "a.b" (.getParentPath (inner-nested b-level))))
+          (is (= "a" (.getParentPath ^NestedQuery (.getChildQuery ^NestedQuery q))))
+          (is (= ["R1"] (search-ids w q)) "R1's a1/b1 holds x; R2's b1 holds only y")))
       (finally (sc/close! w)))))
 
 (deftest a-doc-map-is-written-in-post-order
@@ -1338,6 +1394,26 @@
                                 (in-comments (sc/bool-query [[{:term [:comments.author "alice"]}
                                                               :filter]
                                                              [wrapper :filter]])))))))
+    (testing "REGRESSION: a ParentChildrenBlockJoinQuery visits as a leaf and
+              hides its child query, so a nested query inside it stayed joined
+              to the roots. Under :must-not that excluded nothing, and every
+              alice comment matched. It is refused inside a nested query,
+              whatever it holds"
+      (let [hiding (fn [q] (ParentChildrenBlockJoinQuery. (NestedQuery/parentFilter "comments")
+                                                          q 0))]
+        (doseq [[label q] [["directly" (hiding inner)]
+                           ["holding no nested query" (hiding (MatchAllDocsQuery.))]
+                           ["inside a wrapper that visits it"
+                            (IndexOrDocValuesQuery. (hiding inner) (MatchAllDocsQuery.))]]
+                occur [:filter :must-not]]
+          (testing (str label ", " occur)
+            (is (thrown-with-msg? IllegalArgumentException #"ParentChildrenBlockJoinQuery"
+                                  (in-comments (sc/bool-query [[{:term [:comments.author "alice"]}
+                                                                :filter]
+                                                               [q occur]]))))))
+        (is (thrown-with-msg? IllegalArgumentException #"ParentChildrenBlockJoinQuery"
+                              (in-comments (hiding inner)))
+            "as the whole child query")))
     (testing "malformed paths"
       (doseq [path ["" "." ".comments" "comments." "comments..replies"]]
         (is (thrown? ExceptionInfo (sc/nested-query path {:term [:x "y"]})) (pr-str path))
@@ -1350,27 +1426,65 @@
           "an explicit parent path must be above the path")
       (is (thrown? IllegalArgumentException (NestedQuery/parentFilter "comments."))))))
 
+(defn- bound-replies-by
+  "`replies-by`, built already joined to the comments, as Java could build it:
+  binding inside a nested query on comments has nothing to change."
+  [author]
+  (NestedQuery. "comments.replies" (TermQuery. (Term. "comments.replies.author" ^String author))
+                ScoreMode/Avg "comments" nil))
+
 (deftest supported-wrappers-are-rebuilt-around-the-bound-query
-  (let [w (sc/create-index (under "idx") "main")]
+  (let [w (sc/create-index (under "idx") "main")
+        scores (fn [q] (mapv (juxt #(get % "id") :score) (sc/search w q {:limit 100})))]
     (try
       (seed-threads! w seed-threads)
       (sc/commit! w)
-      (doseq [[label wrap] [["boost" #(BoostQuery. % 2.0)]
-                            ["constant score" #(ConstantScoreQuery. %)]
-                            ["dis-max" #(DisjunctionMaxQuery. [% (replies-by "zed")] 0.1)]
+      ;; Each wrap takes the reply query builder, so that the same wrapper can
+      ;; be built around queries binding must rebuild and around ones it need
+      ;; not touch.
+      (doseq [[label wrap] [["boost" #(BoostQuery. (% "bob") 2.0)]
+                            ["constant score" #(ConstantScoreQuery. (% "bob"))]
+                            ["dis-max" #(DisjunctionMaxQuery. [(% "bob") (% "zed")] 0.1)]
+                            ["a bool with a minimum number of should clauses"
+                             #(-> (BooleanQuery$Builder.)
+                                  (.add (MatchAllDocsQuery.) BooleanClause$Occur/FILTER)
+                                  (.add ^Query (% "bob") BooleanClause$Occur/SHOULD)
+                                  (.add ^Query (% "zed") BooleanClause$Occur/SHOULD)
+                                  (.setMinimumNumberShouldMatch 1)
+                                  (.build))]
                             ["all three, in a bool"
                              #(sc/bool-query [[(BoostQuery.
                                                 (ConstantScoreQuery.
-                                                 (DisjunctionMaxQuery. [% (replies-by "zed")]
+                                                 (DisjunctionMaxQuery. [(% "bob") (% "zed")]
                                                                        0.0))
                                                 3.0)
-                                               :must]])]]]
-        (testing label
-          (is (= ["t1"]
-                 (search-ids w (sc/nested-query
+                                               :must]])]]
+              :let [in-alice (fn [replies]
+                               (sc/nested-query
                                 :comments
                                 (sc/bool-query [[{:term [:comments.author "alice"]} :filter]
-                                                [(wrap (replies-by "bob")) :must]])))))))
+                                                [(wrap replies) :must]])))
+                    rebuilt (in-alice replies-by)
+                    untouched (in-alice bound-replies-by)]]
+        (testing label
+          (is (= ["t1"] (search-ids w rebuilt)))
+          (is (= untouched rebuilt)
+              "rebuilt with the wrapper's own boost, scoring, tie-breaker and
+               minimum should-match")
+          (is (= (scores untouched) (scores rebuilt)))))
+      (testing "a minimum number of should clauses survives rebuilding: without
+                it, every alice comment would match"
+        (is (= [] (search-ids w (sc/nested-query
+                                 :comments
+                                 (sc/bool-query
+                                  [[{:term [:comments.author "alice"]} :filter]
+                                   [(-> (BooleanQuery$Builder.)
+                                        (.add (MatchAllDocsQuery.) BooleanClause$Occur/FILTER)
+                                        (.add ^Query (replies-by "zed") BooleanClause$Occur/SHOULD)
+                                        (.add ^Query (replies-by "erin") BooleanClause$Occur/SHOULD)
+                                        (.setMinimumNumberShouldMatch 1)
+                                        (.build))
+                                    :must]]))))))
       (testing "at top level any wrapper will do: the roots are the parents either way"
         (is (= ["t1" "t2"] (search-ids w (IndexOrDocValuesQuery. (replies-by "bob")
                                                                  (replies-by "bob"))))))
@@ -1402,7 +1516,10 @@
     (is (identical? sc/roots-query (NestedQuery/rootsQuery)))
     (is (identical? sc/roots-bitset (NestedQuery/rootsFilter)))
     (is (identical? sc/roots-bitset (NestedQuery/parentFilter nil)))
-    (is (identical? (NestedQuery/parentFilter "comments") (NestedQuery/parentFilter "comments")))
+    (is (= (NestedQuery/parentFilter "comments") (NestedQuery/parentFilter "comments")))
+    (is (= (hash (NestedQuery/parentFilter "comments"))
+           (hash (NestedQuery/parentFilter "comments"))))
+    (is (not= (NestedQuery/parentFilter "comments") (NestedQuery/parentFilter "comments.replies")))
     (let [w (sc/create-index (under "idx") "main")]
       (try
         (seed-threads! w seed-threads)
@@ -1419,6 +1536,35 @@
                    join))
             (is (= 2 (.count searcher (replies-by "bob"))) "IndexSearcher rewrites it first")))
         (finally (sc/close! w))))))
+
+(deftest path-bitsets-are-cached-per-segment-until-it-closes
+  (testing "REGRESSION, unbounded memory: one QueryBitSetProducer per path, in
+            a static registry, kept every path any caller ever sent, and each
+            kept a closed segment's bitset until its path was used again"
+    (let [w (sc/create-index (under "idx") "main")
+          ^java.util.Map cache (.get (doto (.getDeclaredField NestedQuery "PATH_BITSETS")
+                                       (.setAccessible true))
+                                     nil)
+          core (try
+                 (seed-threads! w seed-threads)
+                 (sc/commit! w)
+                 (with-open [r (sc/snapshot w)]
+                   (let [leaves (.leaves r)
+                         ^LeafReaderContext ctx (first leaves)
+                         filter-bits #(.getBitSet (NestedQuery/parentFilter %) ctx)
+                         ^BitSet comments (filter-bits "comments")
+                         core (.getKey (.getCoreCacheHelper (.reader ctx)))]
+                     (is (= 1 (count leaves)) "precondition: one segment")
+                     (is (= 6 (.cardinality comments)) "t1 2, t2 2, t3 1, t4 1")
+                     (is (identical? comments (filter-bits "comments"))
+                         "computed once, whichever instance asks")
+                     (is (every? nil? (map #(filter-bits (str "nosuch" %)) (range 100))))
+                     (is (= #{"comments"} (set (keys (.get cache core))))
+                         "a path with no documents in the segment is not kept")
+                     (is (= ["t1" "t2"] (search-ids w (replies-by "bob"))))
+                     core))
+                 (finally (sc/close! w)))]
+      (is (not (.containsKey cache core)) "dropped when the segment's core closed"))))
 
 ;; --- Writes on multi-level blocks ---
 
@@ -1600,6 +1746,9 @@
                                ["a grandparent's document before the parent"
                                 [(child "a.b.c" "c") (child "a" "a") (child "a.b" "b")
                                  (prebuilt-root "x")]]
+                               ["a grandparent's document between a child and its parent"
+                                [(child "a.b.c" "c") (child "a" "a1") (child "a.b" "b")
+                                 (child "a" "a2") (prebuilt-root "x")]]
                                ["an empty path segment"
                                 [(child "comments..replies" "r") (child "comments" "c")
                                  (prebuilt-root "x")]]
@@ -1658,6 +1807,27 @@
                                                          {:term [:comments.replies.by "r1"]})
                                         :filter]]))))
             "joined to comments, it is c2's, in another root's block")
+        (finally (sc/close! w)))))
+  (testing "a grandparent's document between a child and its parent, all in one
+            block: every document has an ancestor after it, but the joins at
+            two levels disagree about whose child it is"
+    (let [w (sc/create-index (under "skip") "main")
+          c (sc/nested-query :a.b.c {:term [:a.b.c.by "c"]})
+          a1-holds (fn [inner]
+                     (search-ids w (sc/nested-query
+                                    :a (sc/bool-query [[{:term [:a.by "a1"]} :filter]
+                                                       [inner :filter]]))))]
+      (try
+        (.addDocuments ^BranchIndexWriter (sc/->writer w)
+                       [(prebuilt-nested "a.b.c" "c") (prebuilt-nested "a" "a1")
+                        (prebuilt-nested "a.b" "b") (prebuilt-nested "a" "a2")
+                        (prebuilt-root "x")])
+        (sc/commit! w)
+        (with-open [r (sc/snapshot w)]
+          (is (nil? (CheckJoinIndex/check r sc/roots-bitset)) "CheckJoinIndex passes it")
+          (is (= "child 0 on a.b.c meets a at 1 before its parent at 2" (block-integrity r))))
+        (is (= ["x"] (a1-holds c)) "skipping a level, c joins a1")
+        (is (= [] (a1-holds (sc/nested-query :a.b c))) "level by level, c joins b, and b a2")
         (finally (sc/close! w))))))
 
 ;; --- Store-backed paths, multi-level ---
@@ -1946,7 +2116,38 @@
                                                 {:inner-hits {:size 1}}))
                        "many")
                       "comments" "comments.author"))))
-      (finally (sc/close! w)))))
+      (testing "a :size past the hit's block returns every match in it; the
+                collector is sized by the block, not by :size or the index"
+        (is (= {:total 3 :hits [["alice" [0]] ["alice" [2]] ["alice" [4]]]}
+               (inner ((search (by-alice {:inner-hits {:size Integer/MAX_VALUE}})) "s1")
+                      "comments" "comments.author"))))
+      (testing "a hit with no matching child in its block has none, whether it
+                has children or not"
+        (sc/add-doc w {:id {:value "bare" :type :string}})
+        (let [results (search (sc/bool-query [[(by-alice {:inner-hits true}) :should]
+                                              [{:term [:id "bare"]} :should]
+                                              [{:term [:id "s2"]} :should]]))]
+          (is (= #{"s1" "s2" "bare"} (set (keys results))))
+          (is (= {:total 0 :hits []} (inner (results "bare") "comments" "comments.author")))
+          (is (= {:total 0 :hits []} (inner (results "s2") "comments" "comments.author")))))
+      (finally (sc/close! w))))
+  (testing "a child-less root at the very start of a segment has no children"
+    (let [w (sc/create-index (under "first") "main")]
+      (try
+        (sc/add-doc w {:id {:value "bare" :type :string}})
+        (sc/add-doc w (scored-post "s1" [["alice" 5 "great"]]))
+        (sc/commit! w)
+        (let [results (by-id (sc/search w (sc/bool-query
+                                           [[(sc/nested-query :comments
+                                                              {:term [:comments.author "alice"]}
+                                                              {:inner-hits true})
+                                             :should]
+                                            [{:term [:id "bare"]} :should]])))]
+          (is (= 0 (get-in results ["bare" :doc-id])) "precondition: the first document")
+          (is (= {:total 0 :hits []} (inner (results "bare") "comments" "comments.author")))
+          (is (= {:total 1 :hits [["alice" [0]]]}
+                 (inner (results "s1") "comments" "comments.author"))))
+        (finally (sc/close! w))))))
 
 (defn- two-path-post
   "A root with a :comments and a :reviews child per name, in that order."
@@ -2102,6 +2303,23 @@
                                   (is (nil? more))
                                   (is (= [0] (:path-offsets a-hit)))
                                   (mapv second (:hits (inner a-hit "a.b.c" "a.b.c.v")))))))))
+        (testing "a request two levels below the nearest one, the top: each
+                  level in between narrows its hits to the objects it matched"
+          (let [results (by-id (sc/search w (sc/nested-query
+                                             :a (sc/bool-query
+                                                 [[{:term [:a.name "a1"]} :filter]
+                                                  [(sc/nested-query
+                                                    :a.b (sc/bool-query
+                                                          [[{:term [:a.b.name "b1"]} :filter]
+                                                           [(sc/nested-query :a.b.c (MatchAllDocsQuery.)
+                                                                             {:inner-hits true})
+                                                            :filter]]))
+                                                   :filter]]))))]
+            (assert-hit-shapes (vals results))
+            (is (= {"R1" {:total 1 :hits [["x" [0 0 0]]]}
+                    "R2" {:total 1 :hits [["y" [0 0 0]]]}}
+                   (update-vals results #(inner % "a.b.c" "a.b.c.v")))
+                "not R1's y under a2's b1, nor its y under a1's b2")))
         (finally (sc/close! w))))))
 
 (deftest inner-hits-requests-are-checked-values
@@ -2508,6 +2726,13 @@
                       [(nested "comments.int" {:nested {:filter alice-comment}})]
                       [(nested "comments.int" {:nested {:path :comments :max-children 1}})]]]
           (refused #"sort" sort)))
+      (testing "REGRESSION: a nested sort's :field must be named under its :path.
+                One that is not is on none of the path's objects, so every root
+                sorted as missing, without a word"
+        (doseq [field ["int" "commentsint" "comments" "reviews.int"]]
+          (refused #"named under the path" [(nested field {})]))
+        (refused #"named under the path"
+                 [(nested "comments.int" {:nested {:path "comments.replies"}})]))
       (testing "a nested query in a :filter is bound as by nested-query, with its errors"
         (is (thrown? IllegalArgumentException
                      (sc/search w :all {:sort [(nested "comments.int"

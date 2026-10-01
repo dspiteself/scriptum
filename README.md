@@ -400,8 +400,10 @@ a nested query must all hold for the same object:
   reader: `(.count (IndexSearcher. reader) sc/roots-query)`. `search` stops at
   its `:limit`, so `(count (sc/search writer :all))` does not count roots.
   `sc/roots-bitset` is the matching parents filter for your own block-join
-  queries; share that one instance, since it caches per segment
-  (`NestedQuery/parentFilter` gives the same for the objects on one path).
+  queries; share that one instance, since it caches per segment.
+  `NestedQuery/parentFilter` gives the filter for the objects on one path;
+  any instance of it reuses the bitsets cached for that path, until their
+  segment closes.
 - **Deletes and updates act on whole blocks.** Once an index holds nested
   documents, `delete-docs`, `delete-query` and `update-doc` match roots only,
   and each matched root takes its children with it, at every level. A delete
@@ -412,11 +414,15 @@ a nested query must all hold for the same object:
   write, so concurrent writers need no coordination while an index gets its
   first children.
 - `add-block` adds a pre-built block of Lucene documents, children first and
-  root last, in the order below. Each child carries a `_nested_path`
-  StringField (`sc/nested-path-field`) holding its path, and the root does not.
+  root last, in the order below. Each child carries one `_nested_path`
+  StringField (`sc/nested-path-field`), stored or not, holding its path, and
+  the root does not. Name a child's fields `<path>.<name>`, as `add-doc` does.
   A block of any other shape is refused before anything is written, as is a
   lone child passed to `add-document` and a doc-map with a top-level
-  `_nested_path` key.
+  `_nested_path` key. So is a path in any other field type: stored only, it
+  is not indexed and its child reads as a root; indexed any other way, it
+  fixes the field's schema, and every later nested write on the branch
+  throws.
 - Existing indexes need no migration: a document without `_nested_path` is a
   root.
 - Roots sort by their children's fields with `:nested` in a sort spec; see
@@ -466,6 +472,13 @@ A child map may have `:nested` fields of its own, to any depth:
   `ConstantScoreQuery` or `DisjunctionMaxQuery`, which are rebuilt around it.
   Reached through any other query it cannot be rebound, so `nested-query`
   throws `IllegalArgumentException` rather than join it to the wrong level.
+  Binding finds inner queries through `Query.visit`, though, and cannot check
+  a query whose `visit` hides its subqueries, as the ones Lucene's `JoinUtil`
+  builds do. A nested query hidden in one stays joined to the roots and
+  matches nothing at the inner level: under `:must-not` it then excludes
+  nothing, and the results are wrong, with no error. Keep nested queries out
+  of such queries. Lucene's `ParentChildrenBlockJoinQuery` is one too, and
+  `nested-query` refuses it inside a nested query.
 - **Order.** A block is its root's tree in post-order: each object right after
   its own children, nested fields in doc-map order, the root last. That is
   what lets a block join over the objects on any one path find, for an object
@@ -530,6 +543,12 @@ ES's `inner_hits`: which children of each hit matched. Request them with
   without the outer request above, the result lists bob's replies to alice's
   comments, not his replies to anyone else. A top-level request on a deep path
   (`comments.replies`) lists every matching reply of the root.
+
+  This differs from ES, which ignores a request inside a nested query without
+  one. scriptum answers it a level up, so results carry keys ES's would not,
+  and two such requests of one name that land on one level are refused where
+  ES runs the query. Give each a distinct `:name`, or put `:inner-hits` on the
+  enclosing query.
 - A request under a `:must-not` clause is not answered, as in ES: there a hit
   matches for want of such children.
 - Two requests with one name in one level are refused, as ES refuses them.
@@ -562,8 +581,17 @@ the field's values on its children:
   `comments.replies` sorts each post by all of its replies, under every
   comment. A nested query inside `:filter` joins to the path's objects, as
   inside `nested-query`.
+- `:field` must be named under `:path`, `comments.stars` for `comments`;
+  `add-doc` names a child's fields so. A field of objects further down
+  needs their own `:path`: with `:path` `comments`, `comments.replies.stars`
+  is read on the comments, which do not have it. A dotted name could be a
+  comment's own field, so that is not refused.
 - Without `:nested` a sort reads the roots' own field. A field that only
   children carry has no value on any root, so every root would sort as missing.
+- Not supported: ES's per-level filters (`nested.nested`), `max_children` and
+  a numeric `missing` value, which are refused (`:nested` inside `:nested`,
+  `:max-children`, `:missing 0`), and sorting by ascending score. A deep
+  `:path` without per-level filters reads all of its objects under each root.
 - A sort without `:filter` shares one cached bitset of the path's children per
   segment. A sort with a `:filter` computes the filter's bitset per segment on
   each search, and keeps nothing once the search returns.
@@ -736,8 +764,9 @@ a `ToChildBlockJoinQuery` over it, which is what `delete-docs` does in Clojure.
 From Java, `new NestedQuery("comments", childQuery, ScoreMode.Avg)` is the
 nested query, joined to the roots; nested queries inside `childQuery` are bound
 to `comments` as it is built. `NestedQuery.rootsQuery()`,
-`NestedQuery.rootsFilter()` and `NestedQuery.parentFilter(path)` are the shared
-root query and parents filters. To sort roots by a nested field, give Lucene's
+`NestedQuery.rootsFilter()` and `NestedQuery.parentFilter(path)` are the root
+query and the parents filters, which share their per-segment bitsets across
+every use. To sort roots by a nested field, give Lucene's
 `ToParentBlockJoinSortField` `rootsFilter()` as its parents filter and
 `parentFilter(path)` as its child filter. Its fourth argument, `order`, is
 not a direction: `true` takes the children's maximum and `false` their
