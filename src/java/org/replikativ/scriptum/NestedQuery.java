@@ -1,6 +1,7 @@
 package org.replikativ.scriptum;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -56,6 +57,11 @@ import org.apache.lucene.search.join.ToParentBlockJoinQuery;
  * hides its subqueries, keeps its own binding; a nested query left joined to the roots then
  * matches only roots, which the enclosing level's path filter ({@link #childLevelQuery()})
  * excludes, so it finds nothing rather than the wrong documents.
+ *
+ * <p>INNER HITS. A nested query may carry an inner-hits request ({@link #getInnerHits()}), which
+ * changes nothing about what it matches. {@link #innerHitsOf(Query)} finds the requests in a
+ * query, arranged as their hits nest, and gives each the query its hits must match; scriptum.core's
+ * {@code search} runs those under each hit.
  */
 public final class NestedQuery extends Query {
 
@@ -110,7 +116,8 @@ public final class NestedQuery extends Query {
    *     "comments.author"})
    * @param scoreMode how matching children's scores become the parent's
    * @param parentPath the parents' path, which {@code path} must be under; null for the roots
-   * @param innerHits opaque to this class; carried through binding and compared by equals
+   * @param innerHits null for none; otherwise an inner-hits request, which scriptum.core reads
+   *     (true or an options map). Opaque to this class: carried through binding, compared by equals
    * @throws IllegalArgumentException if a path is malformed, {@code parentPath} is not above {@code
    *     path}, or a contained nested query is not under {@code path} or cannot be bound
    */
@@ -344,7 +351,10 @@ public final class NestedQuery extends Query {
     return parentPath;
   }
 
-  /** Opaque here; carried through binding and part of equality. */
+  /**
+   * The inner-hits request, or null for none. Opaque here; carried through binding and part of
+   * equality.
+   */
   public Object getInnerHits() {
     return innerHits;
   }
@@ -355,6 +365,104 @@ public final class NestedQuery extends Query {
    */
   public Query childLevelQuery() {
     return childLevelQuery;
+  }
+
+  /**
+   * The nested queries in {@code query} that request inner hits, as a tree in which each node's
+   * children are the requests whose hits nest under ITS hits.
+   *
+   * <p>A request's hits nest under its nearest enclosing nested query that also requests inner
+   * hits, as in ES, and under the top-level hit when none does. A nested query in between that
+   * requests none is not a level of the tree; it still constrains the hits below it, see {@link
+   * InnerHitsNode#getHitsQuery()}.
+   *
+   * <p>Found through {@link Query#visit}, so through any query that visits its subqueries, but not
+   * under a MUST_NOT clause, as in ES: a hit matches there for want of such children, so it has
+   * none to show. Not inside Lucene's own block-join queries either, which visit as leaves.
+   */
+  public static List<InnerHitsNode> innerHitsOf(Query query) {
+    List<InnerHitsNode> found = new ArrayList<>();
+    query.visit(new InnerHitsFinder(found, List.of()));
+    return Collections.unmodifiableList(found);
+  }
+
+  /** One inner-hits request in a query, as {@link #innerHitsOf(Query)} finds it. */
+  public static final class InnerHitsNode {
+    private final NestedQuery query;
+    private final Query hitsQuery;
+    private final List<InnerHitsNode> children = new ArrayList<>();
+
+    private InnerHitsNode(NestedQuery query, Query hitsQuery) {
+      this.query = query;
+      this.hitsQuery = hitsQuery;
+    }
+
+    /** The nested query carrying the request, bound as it is in the enclosing query. */
+    public NestedQuery getQuery() {
+      return query;
+    }
+
+    /**
+     * What a document under the enclosing hit must match to be one of this request's hits: its
+     * nested query's {@link NestedQuery#childLevelQuery()}, scored as that alone.
+     *
+     * <p>A nested query between this one and the enclosing hit's level that requests no inner hits
+     * adds a filter: the hit's ancestor on that query's path must match that query's child level,
+     * since only through such an ancestor did the enclosing hit match. A block join over the
+     * documents on that path finds the ancestor, by the same post-order argument as the join
+     * itself.
+     */
+    public Query getHitsQuery() {
+      return hitsQuery;
+    }
+
+    /** The requests whose hits nest under this one's, in the order the query visits them. */
+    public List<InnerHitsNode> getChildren() {
+      return Collections.unmodifiableList(children);
+    }
+  }
+
+  /**
+   * Collects inner-hits requests into {@code found}, the enclosing request's children or the top
+   * level, remembering in {@code between} the nested queries passed through since that level.
+   */
+  private static final class InnerHitsFinder extends QueryVisitor {
+    private final List<InnerHitsNode> found;
+    private final List<NestedQuery> between;
+
+    InnerHitsFinder(List<InnerHitsNode> found, List<NestedQuery> between) {
+      this.found = found;
+      this.between = between;
+    }
+
+    @Override
+    public QueryVisitor getSubVisitor(BooleanClause.Occur occur, Query parent) {
+      if (occur == BooleanClause.Occur.MUST_NOT) {
+        return QueryVisitor.EMPTY_VISITOR;
+      }
+      if (!(parent instanceof NestedQuery nested)) {
+        return this;
+      }
+      if (nested.innerHits == null) {
+        List<NestedQuery> deeper = new ArrayList<>(between);
+        deeper.add(nested);
+        return new InnerHitsFinder(found, deeper);
+      }
+      Query hitsQuery = nested.childLevelQuery;
+      if (!between.isEmpty()) {
+        BooleanQuery.Builder builder =
+            new BooleanQuery.Builder().add(nested.childLevelQuery, BooleanClause.Occur.MUST);
+        for (NestedQuery level : between) {
+          builder.add(
+              new ToChildBlockJoinQuery(level.childLevelQuery, parentFilter(level.path)),
+              BooleanClause.Occur.FILTER);
+        }
+        hitsQuery = builder.build();
+      }
+      InnerHitsNode node = new InnerHitsNode(nested, hitsQuery);
+      found.add(node);
+      return new InnerHitsFinder(node.children, List.of());
+    }
   }
 
   /** The block join this stands for, now that its parents are fixed. */

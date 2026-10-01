@@ -23,16 +23,19 @@
             IntField LongField FloatField DoubleField StoredField
             KnnFloatVectorField]
            [org.apache.lucene.index DirectoryReader IndexReader IndexableField
-            LeafReaderContext Term VectorSimilarityFunction]
+            LeafReaderContext PostingsEnum ReaderUtil StoredFields Term
+            VectorSimilarityFunction]
            [org.apache.lucene.search IndexSearcher Query TermQuery TermInSetQuery PrefixQuery ConstantScoreQuery BooleanQuery
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
-            FieldDoc Sort MatchAllDocsQuery KnnFloatVectorQuery]
-           [org.apache.lucene.search.join QueryBitSetProducer ScoreMode
-            ToChildBlockJoinQuery]
+            FieldDoc Sort MatchAllDocsQuery KnnFloatVectorQuery
+            TopScoreDocCollectorManager]
+           [org.apache.lucene.search.join BitSetProducer ParentChildrenBlockJoinQuery
+            QueryBitSetProducer ScoreMode ToChildBlockJoinQuery]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
            [org.apache.lucene.store Directory FSDirectory]
-           [org.apache.lucene.util BytesRef]
-           [org.replikativ.scriptum BranchIndexWriter BranchedDirectory NestedQuery]))
+           [org.apache.lucene.util BitSet BytesRef]
+           [org.replikativ.scriptum BranchIndexWriter BranchedDirectory NestedQuery
+            NestedQuery$InnerHitsNode]))
 
 (defn- ->path
   "Convert a string to a java.nio.file.Path."
@@ -1008,9 +1011,8 @@
   (\"comments.replies\"), and its fields are named `<path>.<name>`
   (\"comments.replies.author\"), as in ES. So a `:nested` field name may not
   itself contain a dot. The whole tree is written before its root in one
-  atomic block, each object right after its own children. Nothing returns a
-  child's stored fields yet (ES's inner hits), so keep whatever a result must
-  show on the root.
+  atomic block, each object right after its own children. A child's stored
+  fields come back only as inner hits (`nested-query`'s :inner-hits).
 
   For fine-grained control, use Lucene classes directly:
     (let [doc (Document.)]
@@ -1419,6 +1421,83 @@
         (.add builder lucene-q lucene-occur)))
     (.build builder)))
 
+;; --- Inner Hits ---
+;;
+;; ES's `inner_hits`: which children of each hit matched. A nested query
+;; carries the request as data, NestedQuery's `innerHits`, which binding keeps
+;; and equality compares but matching ignores. `search` reads the requests back
+;; out of the query it was given (NestedQuery/innerHitsOf) and, under each hit,
+;; runs one ParentChildrenBlockJoinQuery per request: the block join narrowed to
+;; the children of ONE parent document, scored as the child query alone.
+
+(def ^:private default-inner-hits-size
+  "ES's default inner_hits size."
+  3)
+
+(defn- inner-hits-options
+  "The inner-hits request `spec` of a nested query on `path`, as the map the
+  NestedQuery carries: {:name :size}, and :fields when any are named.
+
+  `spec` is true for the defaults, or a map of :name (default `path`, as in
+  ES), :size (default 3, as in ES) and :fields (the stored fields to return,
+  default all). NORMALIZED, because the map is part of the query's equality:
+  true and {:size 3} are one request, :size is a long and :fields a set of
+  names. Anything else is refused, since a misspelled key would otherwise be
+  dropped without a word."
+  [^String path spec]
+  (when-not (or (true? spec) (map? spec))
+    (throw (ex-info "scriptum: :inner-hits is true or a map of :name, :size and :fields"
+                    {:path path :inner-hits spec})))
+  (let [opts (if (map? spec) spec {})
+        unknown (remove #{:name :size :fields} (keys opts))
+        n (or (:name opts) path)
+        size (or (:size opts) default-inner-hits-size)
+        fields (:fields opts)]
+    (when (seq unknown)
+      (throw (ex-info "scriptum: :inner-hits takes only :name, :size and :fields"
+                      {:path path :unknown (vec unknown)})))
+    (when-not (and (or (string? n) (keyword? n)) (seq (name n)))
+      (throw (ex-info "scriptum: an :inner-hits :name is a non-empty string or keyword"
+                      {:path path :name n})))
+    (when-not (and (integer? size) (<= 0 size Integer/MAX_VALUE))
+      (throw (ex-info "scriptum: an :inner-hits :size is a non-negative integer"
+                      {:path path :size size})))
+    (when-not (or (nil? fields)
+                  (and (coll? fields) (not (map? fields))
+                       (every? #(or (string? %) (keyword? %)) fields)))
+      (throw (ex-info "scriptum: :inner-hits :fields is a collection of field names"
+                      {:path path :fields fields})))
+    (cond-> {:name (name n) :size (long size)}
+      (seq fields) (assoc :fields (into #{} (map name) fields)))))
+
+(defn- inner-hits-requests
+  "The inner hits `query` requests, one map per request at its top level:
+  the request's options, its :path, its :query (what its hits match under the
+  enclosing hit; see NestedQuery$InnerHitsNode) and its :children, the
+  requests whose hits nest under its hits. nil for a query that is not a
+  Lucene Query, since only a NestedQuery requests inner hits.
+
+  TWO REQUESTS OF ONE NAME IN ONE LEVEL ARE REFUSED, as in ES: each level is a
+  map from name to hits, where one would silently replace the other."
+  [query]
+  (when (instance? Query query)
+    (letfn [(level [nodes]
+              (let [requests (mapv request nodes)]
+                (when-let [dup (some (fn [[n c]] (when (> c 1) n))
+                                     (frequencies (map :name requests)))]
+                  (throw (ex-info (str "scriptum: two inner-hits requests are named \"" dup
+                                       "\" in one level; give one a distinct :name")
+                                  {:name dup :paths (mapv :path requests)})))
+                requests))
+            (request [^NestedQuery$InnerHitsNode node]
+              (let [nested (.getQuery node)
+                    path (.getPath nested)]
+                (assoc (inner-hits-options path (.getInnerHits nested))
+                       :path path
+                       :query (.getHitsQuery node)
+                       :children (level (.getChildren node)))))]
+      (level (NestedQuery/innerHitsOf query)))))
+
 (defn nested-query
   "Match the documents that have a child under `path` matching `child-query` —
   ES's `nested` query. At top level those are roots.
@@ -1450,20 +1529,33 @@
   dis-max queries, which are rebuilt around the rebound inner query; anything
   else throws IllegalArgumentException rather than join it to the wrong level.
 
+  INNER HITS. With :inner-hits, `search` and `search-store-snapshot` also
+  return, on each hit, the children that matched this query; `search` shows
+  the shape. A request inside another nested query that has one gives hits
+  under each of ITS hits, as in ES. Requests are checked here, so a misspelled
+  option or two requests of one name in one level throw at once. What the
+  query matches does not change, and every other function ignores the
+  request, except `candidate-page`, which refuses it.
+
   Returns an `org.replikativ.scriptum.NestedQuery`, which becomes Lucene's
   ToParentBlockJoinQuery when a search rewrites it.
 
   Options:
     :score-mode - how the matching children's scores become the parent's:
                   :avg (default, as in ES), :max, :min, :sum or :none
+    :inner-hits - true, or a map of
+                    :name   - their key in a hit's :inner-hits (default: path)
+                    :size   - children per hit, best first (default 3, as in ES)
+                    :fields - the children's stored fields to return
+                              (default all)
 
   Example:
     (nested-query :comments (bool-query [[{:term [:comments.author \"alice\"]} :filter]
                                          [(IntField/newExactQuery \"comments.stars\" 5) :filter]])
-                  {:score-mode :max})"
+                  {:score-mode :max :inner-hits {:size 5}})"
   ([path child-query]
    (nested-query path child-query {}))
-  ([path child-query {:keys [score-mode] :or {score-mode :avg}}]
+  ([path child-query {:keys [score-mode inner-hits] :or {score-mode :avg}}]
    (let [path (name path)
          mode (case score-mode
                 :avg ScoreMode/Avg
@@ -1476,7 +1568,12 @@
      (when-not (NestedQuery/isValidPath path)
        (throw (ex-info "scriptum: a nested path is non-empty field names joined by \".\""
                        {:path path})))
-     (NestedQuery. path (clause->query child-query) ^ScoreMode mode))))
+     (let [q (NestedQuery. path (clause->query child-query) ^ScoreMode mode nil
+                           (when inner-hits (inner-hits-options path inner-hits)))]
+       ;; Every level below this query is complete now, so a duplicate name in
+       ;; one is reported here rather than at the first search.
+       (inner-hits-requests q)
+       q))))
 
 ;; --- Search ---
 
@@ -1528,22 +1625,121 @@
           (.build))
       q)))
 
+(defn- field-filter
+  "Whether to return a stored field, by name: every one when `fields` is empty."
+  [fields]
+  (if (seq fields) (set (map name fields)) (constantly true)))
+
+(defn- stored-field-map
+  "Document `doc`'s stored fields that `keep?` accepts, as name -> string."
+  [^StoredFields stored-fields doc keep?]
+  (into {}
+        (comp (filter (fn [^IndexableField f]
+                        (keep? (.name f))))
+              (map (fn [^IndexableField f]
+                     [(.name f) (.stringValue f)])))
+        (.getFields (.document stored-fields (int doc)))))
+
 (defn- hits->results
   [^IndexSearcher searcher hits fields]
   (let [sf (.storedFields searcher)
-        keep? (if (seq fields) (set (map name fields)) (constantly true))]
+        keep? (field-filter fields)]
     (mapv (fn [^ScoreDoc sd]
-            (let [stored (.document sf (.-doc sd))
-                  field-map (into {}
-                                  (comp (filter (fn [^IndexableField f]
-                                                  (keep? (.name f))))
-                                        (map (fn [^IndexableField f]
-                                               [(.name f) (.stringValue f)])))
-                                  (.getFields stored))]
-              (assoc field-map
-                     :doc-id (.-doc sd)
-                     :score (.-score sd))))
+            (assoc (stored-field-map sf (.-doc sd) keep?)
+                   :doc-id (.-doc sd)
+                   :score (.-score sd)))
           hits)))
+
+(defn- sibling-offset
+  "The position of `doc`, a document on `path` in `ctx`'s segment (leaf-relative
+  id), among its parent's children on `path`: ES's `_nested.offset`, the index
+  of its object in its parent's array.
+
+  Those children are the documents on `path` between the previous document on
+  the parent's path and `doc`'s parent. By post-order the parent is the first
+  document on its path after `doc`, and everything on `path` between that
+  previous one and it is the parent's. The parents' bitset and the postings
+  both still hold deleted documents, so a replaced block keeps its own range
+  until a merge drops it, and nothing of it is counted for a live parent."
+  ^long [^LeafReaderContext ctx ^long doc ^String path]
+  (let [^BitSetProducer parent-filter (NestedQuery/parentFilter (first (path-line path)))
+        ^BitSet parents (.getBitSet parent-filter ctx)
+        start (if (and parents (pos? doc))
+                (inc (.prevSetBit parents (int (dec doc))))
+                0)
+        ^PostingsEnum siblings (.postings (.reader ctx) (Term. nested-path-field path)
+                                          (int PostingsEnum/NONE))]
+    (loop [d (.advance siblings (int start))
+           n 0]
+      (if (< d doc)
+        (recur (.nextDoc siblings) (inc n))
+        n))))
+
+(defn- path-offsets
+  "The offsets of `doc` (leaf-relative, on `path`) and of its ancestors, from
+  the root down: one per segment of `path`, ES's `_nested` chain. A reply at
+  [1 0] is the first reply of the root's second comment.
+
+  An ancestor on path P is the first document on P after `doc`, by post-order."
+  [^LeafReaderContext ctx doc ^String path]
+  (conj (mapv (fn [^String above]
+                (let [^BitSetProducer filter (NestedQuery/parentFilter above)
+                      ^BitSet docs (.getBitSet filter ctx)]
+                  (sibling-offset ctx (.nextSetBit docs (int doc)) above)))
+              (reverse (butlast (path-line path))))
+        (sibling-offset ctx doc path)))
+
+(defn- inner-hits
+  "The `:inner-hits` of `doc`, a hit among the documents `parents` marks (the
+  roots for a top-level hit): for each request, its matching children of
+  `doc`, best first, and how many there are.
+
+  `doc`'s range is every document between the previous one `parents` marks
+  and it, which a request's own path filter narrows to its level. The
+  children of each child hit are found the same way, with the documents on
+  the child's path as the parents."
+  [^IndexSearcher searcher requests ^BitSetProducer parents doc]
+  (let [reader (.getIndexReader searcher)
+        leaves (.leaves reader)
+        sf (.storedFields searcher)
+        child-hit (fn [{:keys [path children]} keep? ^ScoreDoc sd]
+                    (let [child (.-doc sd)
+                          ^LeafReaderContext ctx (.get leaves (ReaderUtil/subIndex child leaves))
+                          offsets (path-offsets ctx (- child (.-docBase ctx)) path)]
+                      (cond-> (assoc (stored-field-map sf child keep?)
+                                     :doc-id child
+                                     :score (.-score sd)
+                                     :nested-path path
+                                     :offset (peek offsets)
+                                     :path-offsets offsets)
+                        (seq children)
+                        (assoc :inner-hits (inner-hits searcher children
+                                                       (NestedQuery/parentFilter path) child)))))]
+    (into {}
+          (map (fn [{:keys [name size fields query] :as request}]
+                 (let [q (ParentChildrenBlockJoinQuery. parents ^Query query (int doc))
+                       ;; A collector sized past the index would allocate for
+                       ;; nothing, and one of size 0 is refused, so count then.
+                       n (min (long size) (.maxDoc reader))
+                       ;; An unbounded threshold makes the total exact, past
+                       ;; the 1000 at which Lucene would stop counting.
+                       ^TopDocs top (when (pos? n)
+                                      (.search searcher q (TopScoreDocCollectorManager.
+                                                           (int n) Integer/MAX_VALUE)))
+                       keep? (field-filter fields)]
+                   [name {:total (if top (.value (.-totalHits top)) (long (.count searcher q)))
+                          :hits (mapv #(child-hit request keep? %)
+                                      (when top (.-scoreDocs top)))}])))
+          requests)))
+
+(defn- with-inner-hits
+  "`results`, top-level hits, each with its `:inner-hits` when `requests` has
+  any; otherwise `results` itself, untouched."
+  [^IndexSearcher searcher requests results]
+  (if (seq requests)
+    (mapv #(assoc % :inner-hits (inner-hits searcher requests roots-bitset (:doc-id %)))
+          results)
+    results))
 
 (defn search
   "Search a branch. Returns a vector of maps with :doc-id, :score, and field values.
@@ -1554,7 +1750,35 @@
     - A string (matches all documents containing this term in any field)
 
   Only root documents are results. `nested-query` matches children but returns
-  their roots, with the root's stored fields only: no child's fields come back.
+  their roots, with the root's stored fields only, unless it asks for inner
+  hits.
+
+  INNER HITS. When `query` holds nested queries with :inner-hits, each result
+  also has :inner-hits, from each request's name to the children of THAT hit
+  that match the request's child query:
+
+    {:inner-hits {\"comments\" {:total 2
+                               :hits [{\"comments.author\" \"alice\"
+                                       :doc-id 7 :score 1.3
+                                       :nested-path \"comments\"
+                                       :offset 1 :path-offsets [1]}
+                                      ...]}}}
+
+  :total counts every matching child, exactly; :hits holds up to the
+  request's :size of them, by score (the child query's alone) and then doc id.
+  A child hit has its stored fields under their full names, filtered by the
+  request's :fields. :offset is its position in its parent's array of
+  :nested-path objects, ES's `_nested.offset`, and :path-offsets the same for
+  each object above it, from the root down, so [1 0] is the first reply of the
+  second comment.
+
+  A request inside another nested query with a request is answered under each
+  of that query's hits, on each child hit's own :inner-hits, as in ES. Inside
+  one WITHOUT a request, it is answered at the nearest level that has one, or
+  at the top: its hits are the matching children whose ancestors match each
+  nested query in between, the objects through which the hit matched. A
+  request under a :must-not clause is not answered, as in ES. Without
+  requests the results are exactly what they would be otherwise.
 
   Options:
     :limit - max results (default 10)
@@ -1591,6 +1815,9 @@
    (search sw query {}))
   ([sw query {:keys [limit fields reader] :or {limit 10}}]
    (let [^BranchIndexWriter writer (->writer sw)
+         ;; From the caller's query, before ->query wraps it, and before a
+         ;; reader is opened for a request that is refused.
+         requests (inner-hits-requests query)
          own-reader? (nil? reader)
          ^DirectoryReader reader (or reader (.openReader writer))]
      (try
@@ -1598,7 +1825,7 @@
              q (->query reader query)
              top-docs (.search searcher q (int limit))
              hits (.-scoreDocs top-docs)]
-         (hits->results searcher hits fields))
+         (with-inner-hits searcher requests (hits->results searcher hits fields)))
        ;; Close only what we opened. A caller-supplied reader outlives this
        ;; call by design — that is the whole point of passing one.
        (finally
@@ -1646,15 +1873,18 @@
   "Search an immutable `StoreSnapshot`, returning the same result vector as
   `search` without requiring a live branch or writer.
 
-  Options are `:limit` (default 10) and `:fields`. For complete, resumable
-  candidate enumeration use `candidate-page` instead."
+  Options are `:limit` (default 10) and `:fields`. Nested queries' inner hits
+  come back as from `search`. For complete, resumable candidate enumeration
+  use `candidate-page` instead."
   ([snapshot query]
    (search-store-snapshot snapshot query {}))
   ([^StoreSnapshot snapshot query {:keys [limit fields] :or {limit 10}}]
-   (let [^DirectoryReader reader (:reader snapshot)
+   (let [requests (inner-hits-requests query)
+         ^DirectoryReader reader (:reader snapshot)
          searcher (IndexSearcher. reader)
          top-docs (.search searcher (->query reader query) (int limit))]
-     (hits->results searcher (.-scoreDocs top-docs) fields))))
+     (with-inner-hits searcher requests
+       (hits->results searcher (.-scoreDocs top-docs) fields)))))
 
 (defn count-store-snapshot
   "Return the exact number of documents matching `query` in an immutable
@@ -1665,7 +1895,8 @@
   estimate names exactly the same generation as a subsequent candidate scan.
 
   On an index holding nested documents it counts ROOTS, as `search` returns
-  them: `:all` is the number of roots, and nested children are not counted."
+  them: `:all` is the number of roots, and nested children are not counted.
+  Inner-hits requests change no count, so they are ignored."
   [^StoreSnapshot snapshot query]
   (let [^DirectoryReader reader (:reader snapshot)
         searcher (IndexSearcher. reader)]
@@ -1718,7 +1949,14 @@
   checked on resume.
 
   On an index holding nested documents the candidates are ROOTS only, as in
-  `search`; the continuation's query then carries the root filter."
+  `search`; the continuation's query then carries the root filter.
+
+  A query requesting inner hits is REFUSED rather than paged without them.
+  Candidates come back with no children, so the request could only be
+  dropped, and a caller relying on it would find out from missing data.
+  Answering it would run a child search per candidate on every page, work a
+  complete scan for an external recheck has no use for. Use
+  `search-store-snapshot` for inner hits."
   ([snapshot query]
    (candidate-page snapshot query {}))
   ([^StoreSnapshot snapshot query {:keys [page-size after fields query-id order]
@@ -1731,6 +1969,11 @@
    (when-not (contains? #{:score :doc-id} order)
      (throw (ex-info "scriptum: candidate order must be :score or :doc-id"
                      {:order order})))
+   (when-let [requests (seq (inner-hits-requests query))]
+     (throw (ex-info (str "scriptum: candidate-page returns no inner hits; drop :inner-hits"
+                          " from the nested queries, or use search-store-snapshot")
+                     {:type :scriptum/inner-hits-unsupported
+                      :inner-hits (mapv :name requests)})))
    (let [address (:snapshot-address snapshot)
          ^DirectoryReader reader (:reader snapshot)
          searcher (IndexSearcher. reader)

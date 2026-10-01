@@ -1823,3 +1823,388 @@
             (sc/release-generation! generation))
           (finally (sc/close! generation))))
       (finally (sc/close! source)))))
+
+;; =============================================================================
+;; Inner hits
+;; =============================================================================
+
+(defn- inner
+  "The inner hits named `name` on `hit`, each as [its `field`, its
+  :path-offsets], in hit order, with their :total."
+  [hit name field]
+  (let [{:keys [total hits]} (get-in hit [:inner-hits name])]
+    {:total total :hits (mapv (juxt #(get % field) :path-offsets) hits)}))
+
+(defn- by-id [results]
+  (into {} (map (juxt #(get % "id") identity)) results))
+
+(defn- every-inner-hit
+  "Every inner hit under `results`, at every depth."
+  [results]
+  (mapcat (fn [result]
+            (mapcat (fn [{:keys [hits]}] (concat hits (every-inner-hit hits)))
+                    (vals (:inner-hits result))))
+          results))
+
+(defn- assert-hit-shapes
+  "Every inner hit under `results` names its path, has one offset per path
+  segment ending in :offset, and comes best first, ties in doc-id order."
+  [results]
+  (doseq [hit (every-inner-hit results)]
+    (is (= (count (str/split (:nested-path hit) #"\.")) (count (:path-offsets hit))))
+    (is (= (peek (:path-offsets hit)) (:offset hit))))
+  (doseq [result (concat results (every-inner-hit results))
+          {:keys [hits]} (vals (:inner-hits result))]
+    (is (every? (fn [[a b]] (or (> (:score a) (:score b))
+                                (and (= (:score a) (:score b)) (< (:doc-id a) (:doc-id b)))))
+                (partition 2 1 hits)))))
+
+(defn- scored-post
+  "A root with one :comments child per [author stars body]."
+  [id comments]
+  {:id {:value id :type :string}
+   :comments {:type :nested
+              :value (mapv (fn [[author stars body]]
+                             {:author {:value author :type :string}
+                              :stars {:value stars :type :int}
+                              :body {:value body :type :text}})
+                           comments)}})
+
+(def ^:private scored-posts
+  [["s1" [["alice" 5 "great post"]
+          ["bob" 1 "bad post"]
+          ["alice" 3 "great great post"]
+          ["carol" 4 "great"]
+          ["alice" 2 "fine"]]]
+   ["s2" [["dave" 2 "great"]]]
+   ["s3" [["erin" 4 "dull"]]]])
+
+(deftest inner-hits-show-which-children-matched
+  (let [w (sc/create-index (under "idx") "main")
+        source (into {} scored-posts)
+        by-alice (fn [opts] (sc/nested-query :comments {:term [:comments.author "alice"]} opts))
+        search (fn [q] (by-id (sc/search w q {:limit 100})))]
+    (try
+      (doseq [[id comments] scored-posts]
+        (sc/add-doc w (scored-post id comments)))
+      (sc/commit! w)
+      (testing "each hit carries ITS matching children, named for the path"
+        (let [results (search (by-alice {:inner-hits true}))]
+          (assert-hit-shapes (vals results))
+          (is (= ["s1"] (keys results)))
+          (is (= {:total 3 :hits [["alice" [0]] ["alice" [2]] ["alice" [4]]]}
+                 (inner (results "s1") "comments" "comments.author"))
+              "equal scores, so in doc-id order, which is source order")
+          (testing "with every stored field, under its full name, and where it sits"
+            (is (= {"comments.author" "alice" "comments.stars" "3"
+                    "comments.body" "great great post"
+                    :nested-path "comments" :offset 2 :path-offsets [2]}
+                   (dissoc (get-in results ["s1" :inner-hits "comments" :hits 1])
+                           :doc-id :score))))))
+      (testing ":size keeps the best children and :total still counts them all"
+        (is (= {:total 3 :hits [["alice" [0]] ["alice" [2]]]}
+               (inner ((search (by-alice {:inner-hits {:size 2}})) "s1")
+                      "comments" "comments.author")))
+        (is (= {:total 3 :hits []}
+               (inner ((search (by-alice {:inner-hits {:size 0}})) "s1")
+                      "comments" "comments.author"))))
+      (testing ":fields picks the children's stored fields; :name the key"
+        (let [hit (get-in (search (by-alice {:inner-hits {:name "by-alice"
+                                                          :fields [:comments.body]}}))
+                          ["s1" :inner-hits "by-alice" :hits 0])]
+          (is (= #{"comments.body" :doc-id :score :nested-path :offset :path-offsets}
+                 (set (keys hit))))))
+      (testing "a child's score is the child query's own, which the root's aggregates"
+        (doseq [mode [:max :sum]]
+          (let [results (search (sc/nested-query :comments (sc/text-query "comments.body" "great")
+                                                 {:score-mode mode :inner-hits {:size 10}}))
+                hits (get-in results ["s1" :inner-hits "comments" :hits])]
+            (assert-hit-shapes (vals results))
+            (is (= #{"s1" "s2"} (set (keys results))))
+            (is (= #{0 2 3} (set (map :offset hits))) "every great comment, alice's or not")
+            (is (apply >= (map :score hits)))
+            (is (< (:score (peek hits)) (:score (first hits))) "precondition: scores differ")
+            (doseq [{:keys [offset] :as hit} hits
+                    :let [[author stars body] (nth (source "s1") offset)]]
+              (is (= [author (str stars) body]
+                     (map hit ["comments.author" "comments.stars" "comments.body"]))
+                  "the offset leads back to the source object"))
+            (case mode
+              :max (is (= (:score (first hits)) (get-in results ["s1" :score])))
+              :sum (is (< (Math/abs (- (reduce + (map :score hits))
+                                       (get-in results ["s1" :score])))
+                          1e-5))))))
+      (testing "without a request the results are exactly what they were"
+        (let [plain (sc/search w (by-alice {}) {:limit 100})]
+          (is (not-any? #(contains? % :inner-hits) plain))
+          (is (= plain (mapv #(dissoc % :inner-hits)
+                             (sc/search w (by-alice {:inner-hits true}) {:limit 100}))))))
+      (testing ":total is exact past the 1000 at which Lucene stops counting"
+        (sc/add-doc w (scored-post "many" (repeat 1200 ["many" 1 "x"])))
+        (is (= {:total 1200 :hits [["many" [0]]]}
+               (inner ((search (sc/nested-query :comments {:term [:comments.author "many"]}
+                                                {:inner-hits {:size 1}}))
+                       "many")
+                      "comments" "comments.author"))))
+      (finally (sc/close! w)))))
+
+(defn- two-path-post
+  "A root with a :comments and a :reviews child per name, in that order."
+  [id comments reviews]
+  (let [children (fn [names] {:type :nested
+                              :value (mapv (fn [n] {:by {:value n :type :string}}) names)})]
+    {:id {:value id :type :string}
+     :comments (children comments)
+     :reviews (children reviews)}))
+
+(deftest inner-hit-offsets-survive-updates-and-merges
+  (testing "an offset counts only its path's documents under the same parent,
+            in whichever segment the block landed, before and after a merge"
+    (let [w (sc/create-index (under "idx") "main")
+          every-child (fn [path]
+                        (sc/nested-query path (MatchAllDocsQuery.) {:inner-hits {:size 100}}))
+          seen (fn [path]
+                 (let [results (sc/search w (every-child path) {:limit 100})]
+                   (assert-hit-shapes results)
+                   (into {}
+                         (map (fn [r] [(get r "id") (:hits (inner r path (str path ".by")))]))
+                         results)))
+          expect (fn [roots path]
+                   (into {}
+                         (keep (fn [[id names]]
+                                 (when (seq names)
+                                   [id (vec (map-indexed (fn [i n] [n [i]]) names))])))
+                         (for [[id comments reviews] roots]
+                           [id (if (= path "comments") comments reviews)])))
+          assert-offsets (fn [roots]
+                           (is (= (expect roots "comments") (seen "comments")))
+                           (is (= (expect roots "reviews") (seen "reviews"))))]
+      (try
+        ;; r0 is replaced below, which leaves its deleted block BEFORE r1's
+        ;; live one in this segment: r1's range starts at a deleted root.
+        (sc/add-doc w (two-path-post "r0" ["a0" "a1"] ["b0"]))
+        (sc/add-doc w (two-path-post "r1" ["c0" "c1" "c2"] ["v0" "v1"]))
+        (sc/commit! w)
+        ;; Pre-built, so the two paths interleave at one level.
+        (sc/add-block w [(prebuilt-nested "comments" "x0") (prebuilt-nested "reviews" "y0")
+                         (prebuilt-nested "comments" "x1") (prebuilt-nested "reviews" "y1")
+                         (prebuilt-nested "comments" "x2") (prebuilt-root "r2")])
+        (sc/commit! w)
+        (sc/add-doc w (two-path-post "r3" ["d0" "d1"] ["w0"]))
+        (sc/commit! w)
+        (with-open [r (sc/snapshot w)]
+          (is (= 3 (count (.leaves r))) "precondition: blocks past the first segment"))
+        (assert-offsets [["r0" ["a0" "a1"] ["b0"]]
+                         ["r1" ["c0" "c1" "c2"] ["v0" "v1"]]
+                         ["r2" ["x0" "x1" "x2"] ["y0" "y1"]]
+                         ["r3" ["d0" "d1"] ["w0"]]])
+        (sc/update-doc w "id" "r0" (two-path-post "r0" ["e0" "e1" "e2" "e3"] []))
+        (sc/update-doc w "id" "r3" (two-path-post "r3" ["f0"] ["g0" "g1"]))
+        (sc/commit! w)
+        (let [after [["r0" ["e0" "e1" "e2" "e3"] []]
+                     ["r1" ["c0" "c1" "c2"] ["v0" "v1"]]
+                     ["r2" ["x0" "x1" "x2"] ["y0" "y1"]]
+                     ["r3" ["f0"] ["g0" "g1"]]]]
+          (testing "beside the deleted blocks they replaced"
+            (with-open [r (sc/snapshot w)]
+              (is (< 0 (.numDeletedDocs r)) "precondition: deleted blocks still in place"))
+            (assert-offsets after))
+          (.forceMerge (sc/->writer w) 1)
+          (sc/commit! w)
+          (assert-writer-blocks-intact w)
+          (testing "after the merge renumbered every document"
+            (with-open [r (sc/snapshot w)]
+              (is (= 1 (count (.leaves r))))
+              (is (zero? (.numDeletedDocs r))))
+            (assert-offsets after)))
+        (finally (sc/close! w))))))
+
+(def ^:private reply-threads
+  "u2 has bob replies under alice's comments and two under bob's own comment:
+  only the first are under a comment by alice."
+  [["u1" [["alice" "bob"] ["carol"]]]
+   ["u2" [["alice" "bob" "zed" "bob"] ["bob" "bob" "bob"] ["alice" "zed"] ["alice" "bob"]]]
+   ["u3" [["carol" "bob"]]]])
+
+(defn- alice-with-bob
+  "Comments by alice with a reply by bob, with the given inner-hits requests."
+  [outer-hits inner-hits]
+  (sc/nested-query :comments
+                   (sc/bool-query [[{:term [:comments.author "alice"]} :filter]
+                                   [(replies-by "bob" {:inner-hits inner-hits}) :filter]])
+                   {:inner-hits outer-hits}))
+
+(deftest inner-hits-nest-like-their-queries
+  (let [w (sc/create-index (under "idx") "main")
+        search (fn [q] (let [results (sc/search w q {:limit 100})]
+                         (assert-hit-shapes results)
+                         (by-id results)))
+        replies (fn [hit] (inner hit "comments.replies" "comments.replies.author"))]
+    (try
+      (seed-threads! w reply-threads)
+      (sc/commit! w)
+      (testing "a request inside a request: replies under EACH matching comment"
+        (let [results (search (alice-with-bob {:size 10} {:size 10}))
+              comments #(get-in results [% :inner-hits "comments" :hits])]
+          (is (= #{"u1" "u2"} (set (keys results))))
+          (is (= [[0] [3]] (map :path-offsets (comments "u2")))
+              "alice's comment with only a zed reply is no hit: the reply query
+               bound inside the comment level still runs inside the per-parent join")
+          (is (= [{:total 2 :hits [["bob" [0 0]] ["bob" [0 2]]]}
+                  {:total 1 :hits [["bob" [3 0]]]}]
+                 (map replies (comments "u2"))))
+          (is (= [{:total 1 :hits [["bob" [0 0]]]}] (map replies (comments "u1"))))
+          (is (= ["comments"] (keys (:inner-hits (results "u1"))))
+              "the replies hang under the comments, not the root")))
+      (testing "a request inside a nested query WITHOUT one is answered at the
+                level above, through the objects that matched"
+        (let [results (search (alice-with-bob nil {:size 10}))]
+          (is (= {:total 3 :hits [["bob" [0 0]] ["bob" [0 2]] ["bob" [3 0]]]}
+                 (replies (results "u2")))
+              "not the bob replies under bob's comment, which matched nothing")
+          (is (= {:total 1 :hits [["bob" [0 0]]]} (replies (results "u1"))))))
+      (testing "a top-level request on a deep path: every matching reply of the root"
+        (let [results (search (replies-by "bob" {:inner-hits {:size 10}}))]
+          (is (= {:total 5 :hits [["bob" [0 0]] ["bob" [0 2]] ["bob" [1 0]] ["bob" [1 1]]
+                                  ["bob" [3 0]]]}
+                 (replies (results "u2"))))
+          (is (= {:total 1 :hits [["bob" [0 0]]]} (replies (results "u3"))))))
+      (testing "a request under :must-not is not answered, as in ES: the hit
+                matched for want of such children"
+        (let [results (search (sc/nested-query
+                               :comments
+                               (sc/bool-query [[{:term [:comments.author "alice"]} :filter]
+                                               [(replies-by "bob" {:inner-hits true}) :must-not]])
+                               {:inner-hits true}))]
+          (is (= ["u2"] (keys results)))
+          (is (= [{"comments.author" "alice" :path-offsets [2]}]
+                 (map #(select-keys % ["comments.author" :path-offsets :inner-hits])
+                      (get-in results ["u2" :inner-hits "comments" :hits]))))))
+      (finally (sc/close! w))))
+  (testing "three levels, the innermost request directly inside the outermost"
+    (let [w (sc/create-index (under "tree") "main")]
+      (try
+        (doseq [[id as] seed-trees]
+          (sc/add-doc w (tree id as)))
+        (sc/commit! w)
+        (let [results (by-id (sc/search w (sc/nested-query
+                                           :a (sc/bool-query
+                                               [[{:term [:a.name "a1"]} :filter]
+                                                [(sc/nested-query :a.b.c {:term [:a.b.c.v "y"]}
+                                                                  {:inner-hits true})
+                                                 :filter]])
+                                           {:inner-hits true})))]
+          (assert-hit-shapes (vals results))
+          (is (= {"R1" [[0 1 0]] "R2" [[0 0 0]] "R3" [[0 0 1]]}
+                 (update-vals results
+                              (fn [r]
+                                (let [[a-hit & more] (get-in r [:inner-hits "a" :hits])]
+                                  (is (nil? more))
+                                  (is (= [0] (:path-offsets a-hit)))
+                                  (mapv second (:hits (inner a-hit "a.b.c" "a.b.c.v")))))))))
+        (finally (sc/close! w))))))
+
+(deftest inner-hits-requests-are-checked-values
+  (let [by-alice (fn [opts] (sc/nested-query :comments {:term [:comments.author "alice"]} opts))
+        named (fn [n] {:inner-hits {:name n}})]
+    (testing "normalized, so equal requests make equal queries"
+      (is (= (by-alice {:inner-hits true})
+             (by-alice {:inner-hits {:name "comments" :size 3}})
+             (by-alice {:inner-hits {:name :comments}})))
+      (is (= {:name "comments" :size 3}
+             (.getInnerHits ^NestedQuery (by-alice {:inner-hits true}))))
+      (is (= (by-alice {:inner-hits {:fields [:comments.body "comments.stars"]}})
+             (by-alice {:inner-hits {:fields #{"comments.stars" "comments.body"}}})))
+      (is (= (by-alice {}) (by-alice {:inner-hits false}) (by-alice {:inner-hits nil})))
+      (is (not= (by-alice {}) (by-alice {:inner-hits true})))
+      (is (not= (by-alice {:inner-hits true}) (by-alice {:inner-hits {:size 4}})))
+      (is (= "comments.replies"
+             (:name (.getInnerHits ^NestedQuery (replies-by "bob" {:inner-hits true}))))
+          "the default name is the whole path"))
+    (testing "a malformed request is refused when the query is built"
+      (doseq [spec [{:size -1} {:size 1.5} {:size "3"} {:sise 3} {:name ""} {:name 7}
+                    {:fields "comments.body"} {:fields {:a 1}} {:fields [1]} "yes" 3]]
+        (is (thrown-with-msg? ExceptionInfo #":inner-hits" (by-alice {:inner-hits spec}))
+            (pr-str spec))))
+    (testing "two requests of one name in one level are refused, as in ES"
+      (let [two-replies (fn [a b] (sc/bool-query [[(replies-by "bob" a) :should]
+                                                  [(replies-by "zed" b) :should]]))]
+        (testing "inside one nested query, as it is built"
+          (is (thrown-with-msg?
+               ExceptionInfo #"two inner-hits requests are named \"comments.replies\""
+               (sc/nested-query :comments
+                                (two-replies {:inner-hits true} {:inner-hits true})
+                                {:inner-hits true}))))
+        (testing "through a nested query without a request, where both land a level up"
+          (is (thrown? ExceptionInfo
+                       (sc/nested-query :comments
+                                        (two-replies {:inner-hits true} {:inner-hits true})))))
+        (testing "but distinct names, or one name at two levels, are fine"
+          (is (sc/nested-query :comments (two-replies (named "b") (named "z")) (named "b"))))))
+    (let [w (sc/create-index (under "idx") "main")
+          either (fn [a b] (sc/bool-query [[a :should] [b :should]]))]
+      (try
+        (seed! w seed-posts)
+        (sc/commit! w)
+        (testing "at the top level, only the search sees both, and refuses them"
+          (is (thrown-with-msg? ExceptionInfo #"named \"comments\""
+                                (sc/search w (either (by-alice {:inner-hits true})
+                                                     (sc/nested-query
+                                                      :comments {:term [:comments.author "bob"]}
+                                                      {:inner-hits true})))))
+          (let [by-bob (sc/nested-query :comments {:term [:comments.author "bob"]}
+                                        (named "bob"))
+                [p1] (sc/search w (either (by-alice (named "alice")) by-bob) {:limit 1})]
+            (is (= "p1" (get p1 "id")))
+            (is (= {"alice" {:total 1 :hits [["alice" [0]]]}
+                    "bob" {:total 1 :hits [["bob" [1]]]}}
+                   (update-vals (:inner-hits p1)
+                                (fn [{:keys [total hits]}]
+                                  {:total total
+                                   :hits (mapv (juxt #(get % "comments.author") :path-offsets)
+                                               hits)}))))))
+        (testing "a NestedQuery built in Java reads its request the same way"
+          (let [child (.childLevelQuery ^NestedQuery (by-alice {}))
+                java-built (NestedQuery. "comments" child ScoreMode/Avg nil {:size 1})]
+            (is (= {"p1" {:total 1 :hits [["alice" [0]]]}
+                    "p3" {:total 1 :hits [["alice" [0]]]}}
+                   (update-vals (by-id (sc/search w java-built))
+                                #(inner % "comments" "comments.author"))))
+            (is (thrown? ExceptionInfo
+                         (sc/search w (NestedQuery. "comments" child ScoreMode/Avg nil "all"))))))
+        (finally (sc/close! w))))))
+
+(deftest inner-hits-from-a-store-snapshot
+  (let [s (store-at (under "store"))
+        c (under "cache")
+        w (sc/open-store-index s c "main")
+        q (alice-with-bob {:size 10} {:size 10})]
+    (try
+      (seed-threads! w reply-threads)
+      (sc/commit! w)
+      (with-open [snap (sc/open-store-snapshot s c (sc/snapshot-address w))]
+        (testing "search-store-snapshot answers as search does"
+          (let [results (sc/search-store-snapshot snap q {:limit 100})]
+            (assert-hit-shapes results)
+            (is (= (sc/search w q {:limit 100}) results))
+            (is (= [{:total 2 :hits [["bob" [0 0]] ["bob" [0 2]]]}
+                    {:total 1 :hits [["bob" [3 0]]]}]
+                   (map #(inner % "comments.replies" "comments.replies.author")
+                        (get-in (by-id results) ["u2" :inner-hits "comments" :hits]))))))
+        (testing "count-store-snapshot counts the same roots, request or not"
+          (is (= 2 (sc/count-store-snapshot snap q)
+                 (sc/count-store-snapshot snap (alice-with-bob nil nil)))))
+        (testing "candidate-page refuses a request it could only drop"
+          (doseq [query [q
+                         (alice-with-bob nil true)
+                         (sc/bool-query [[(MatchAllDocsQuery.) :filter]
+                                         [(replies-by "bob" {:inner-hits true}) :should]])]]
+            (let [e (try (sc/candidate-page snap query {:page-size 10})
+                         nil
+                         (catch ExceptionInfo e e))]
+              (is (= :scriptum/inner-hits-unsupported (:type (ex-data e))) (str query))))
+          (is (= ["u1" "u2"]
+                 (ids (:candidates (sc/candidate-page snap (alice-with-bob nil nil)
+                                                      {:page-size 10}))))
+              "the same query without requests pages as before")))
+      (finally (sc/close! w)))))

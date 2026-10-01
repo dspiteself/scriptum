@@ -354,9 +354,8 @@ a nested query must all hold for the same object:
 - **Only roots are results.** `search`, `:all`, `search-store-snapshot`,
   `count-store-snapshot` and `candidate-page` never return a child.
   `nested-query` matches children but returns their roots, and a hit carries
-  the root's stored fields only: no child's values come back yet (there are no
-  inner hits). Keep whatever a result must show on the root, for example as
-  `:stored-only`.
+  the root's stored fields. The children that matched come back only as
+  [inner hits](#inner-hits), on request.
 - **Counting.** `num-docs` and `max-doc` count Lucene documents, children
   included, as ES's index stats do. To count roots, use
   `(sc/count-store-snapshot snap :all)`, or count `sc/roots-query` over any
@@ -382,7 +381,7 @@ a nested query must all hold for the same object:
   `_nested_path` key.
 - Existing indexes need no migration: a document without `_nested_path` is a
   root.
-- Not supported yet: inner hits, and sorting by a nested field.
+- Not supported yet: sorting by a nested field.
 
 The whole-block rule exists because a root deleted without its children
 corrupts the index silently. Before a merge, nested queries still return the
@@ -441,6 +440,66 @@ its path, score mode and binding as data and becomes Lucene's
 `ToParentBlockJoinQuery` when a search rewrites it. A `ToParentBlockJoinQuery`
 built directly cannot be rebound, because it exposes neither its parents
 filter nor its score mode.
+
+#### Inner hits
+
+ES's `inner_hits`: which children of each hit matched. Request them with
+`:inner-hits` on a `nested-query`, and each result carries them:
+
+```clojure
+(sc/search writer
+  (sc/nested-query :comments {:term [:comments.author "alice"]}
+                   {:inner-hits {:size 2 :fields [:comments.stars]}}))
+;; => [{"id" "post-1" "title" "Nested documents" :doc-id 2 :score 0.315
+;;      :inner-hits {"comments" {:total 1
+;;                               :hits [{"comments.stars" "5"
+;;                                       :doc-id 0 :score 0.315
+;;                                       :nested-path "comments"
+;;                                       :offset 0 :path-offsets [0]}]}}}
+;;     ...]
+```
+
+- `:inner-hits` is `true`, or a map of `:name` (the key in `:inner-hits`,
+  default the path), `:size` (children per hit, default 3 as in ES) and
+  `:fields` (the children's stored fields to return, default all).
+- `:total` is the exact number of the hit's children that match the child
+  query. `:hits` holds the best `:size` of them, by the child query's own
+  score and then doc id, each with its stored fields under their full names.
+- `:offset` is the child's position in its parent's array of objects on its
+  path, ES's `_nested.offset`; objects on other paths do not count.
+  `:path-offsets` gives that position for the child and every object above
+  it, root first, so a reply at `[1 0]` is the first reply of the second
+  comment.
+- **Nesting.** A request inside another nested query that has one is
+  answered under each of that query's hits, as in ES:
+
+  ```clojure
+  ;; Each comment hit carries its own :inner-hits {"comments.replies" ...}:
+  ;; the replies by bob to THAT comment.
+  (sc/nested-query :comments
+                   (sc/bool-query [[{:term [:comments.author "alice"]} :filter]
+                                   [(sc/nested-query :comments.replies
+                                                     {:term [:comments.replies.author "bob"]}
+                                                     {:inner-hits true})
+                                    :filter]])
+                   {:inner-hits true})
+  ```
+
+  Inside a nested query WITHOUT a request, it is answered at the nearest
+  level up that has one, or on the result itself. Its hits are then the
+  matching children under objects that match every nested query in between:
+  without the outer request above, the result lists bob's replies to alice's
+  comments, not his replies to anyone else. A top-level request on a deep path
+  (`comments.replies`) lists every matching reply of the root.
+- A request under a `:must-not` clause is not answered, as in ES: there a hit
+  matches for want of such children.
+- Two requests with one name in one level are refused, as ES refuses them.
+  `nested-query` checks the levels inside it as it is built, and `search` the
+  whole query.
+- `search` and `search-store-snapshot` return inner hits. Matching is
+  unchanged, so `count-store-snapshot` and deletes ignore the request.
+  `candidate-page` refuses it: candidates carry no children, so the request
+  could only be dropped.
 
 ### Time Travel
 
