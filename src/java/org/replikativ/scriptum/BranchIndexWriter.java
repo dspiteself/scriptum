@@ -159,8 +159,9 @@ public class BranchIndexWriter implements Closeable {
   private static final String HASH_METADATA_DIR = "scriptum-hashes";
 
   /**
-   * The field every nested (block-join) child carries, holding its path. Parents never carry it,
-   * so a document without it is a parent. scriptum.core's {@code nested-path-field}.
+   * The field every nested (block-join) child carries, holding its path: dot-joined field names,
+   * one per nesting level ({@code "comments.replies"}). Roots never carry it, so a document without
+   * it is a root. scriptum.core's {@code nested-path-field}; {@link NestedQuery} queries by it.
    */
   public static final String NESTED_PATH_FIELD = "_nested_path";
 
@@ -797,6 +798,10 @@ public class BranchIndexWriter implements Closeable {
    * addDocuments} call guarantees the block is contiguous — no concurrent add can land inside it,
    * and a flush never splits it across segments. Adding the same documents one at a time gives no
    * such guarantee. Each child carries {@link #NESTED_PATH_FIELD}; the parent does not.
+   *
+   * <p>A child may have children of its own, written before it in the same block: the block is
+   * its root's tree in post-order, each nested object after its own children and the root last.
+   * That order is what lets {@link NestedQuery} join any level to any level above it.
    *
    * <p>A BLOCK IS DELETED WHOLE OR NOT AT ALL. {@link #deleteDocuments(Term...)} or {@link
    * #updateDocument} on a parent's id removes the parent and leaves its children live: block-join

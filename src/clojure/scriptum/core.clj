@@ -28,11 +28,11 @@
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
             FieldDoc Sort MatchAllDocsQuery KnnFloatVectorQuery]
            [org.apache.lucene.search.join QueryBitSetProducer ScoreMode
-            ToChildBlockJoinQuery ToParentBlockJoinQuery]
+            ToChildBlockJoinQuery]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
            [org.apache.lucene.store Directory FSDirectory]
            [org.apache.lucene.util BytesRef]
-           [org.replikativ.scriptum BranchIndexWriter BranchedDirectory]))
+           [org.replikativ.scriptum BranchIndexWriter BranchedDirectory NestedQuery]))
 
 (defn- ->path
   "Convert a string to a java.nio.file.Path."
@@ -632,6 +632,13 @@
 ;; it is a root — which makes every index written before nested existed valid
 ;; as it stands.
 ;;
+;; A nested object may hold nested objects of its own. Its path then names
+;; every level above it, one field name per level ("comments.replies"), and the
+;; block is the root's tree in POST-ORDER: each object right after its own
+;; children, the root last. That order is what lets a block join over the
+;; documents on any one path find, for a document below it, its own ancestor
+;; on that path; NestedQuery spells out why.
+;;
 ;; THE HAZARD IS A ROOT DELETED WITHOUT ITS CHILDREN. Until a merge, a nested
 ;; query still returns the deleted root through its live children; after one
 ;; they silently join the NEXT root's block, and `CheckJoinIndex` passes the
@@ -648,28 +655,28 @@
 ;; the term delete that followed.
 
 (def ^String nested-path-field
-  "The field every nested child carries, holding its path (\"comments\").
-  Roots never carry it."
+  "The field every nested child carries, holding its path (\"comments\", or
+  \"comments.replies\" one level down). Roots never carry it."
   BranchIndexWriter/NESTED_PATH_FIELD)
 
 (def ^Query roots-query
   "Matches every document that is not a nested child, i.e. every root.
 
-  `exists` is a PrefixQuery on the empty prefix, which matches any indexed
-  value. `FieldExistsQuery` cannot stand in: it reads doc values or norms, a
-  StringField has neither, and it throws."
-  (-> (BooleanQuery$Builder.)
-      (.add (MatchAllDocsQuery.) BooleanClause$Occur/FILTER)
-      (.add (PrefixQuery. (Term. ^String nested-path-field ""))
-            BooleanClause$Occur/MUST_NOT)
-      (.build)))
+  The SAME INSTANCE as `NestedQuery/rootsQuery`, so the root filter `search`
+  adds and the one a nested query joins to are one object. A PrefixQuery on the
+  empty prefix tests that `nested-path-field` exists: `FieldExistsQuery`
+  cannot, since it reads doc values or norms, a StringField has neither, and
+  it throws."
+  (NestedQuery/rootsQuery))
 
-(def roots-bitset
-  "The parents filter of every block join here.
+(def ^QueryBitSetProducer roots-bitset
+  "The parents filter of every root-level block join here.
 
-  ONE SHARED INSTANCE, because `QueryBitSetProducer` caches its bitset per
-  segment core; a fresh producer per query would recompute it on every search."
-  (QueryBitSetProducer. roots-query))
+  ONE SHARED INSTANCE, `NestedQuery/rootsFilter`, because `QueryBitSetProducer`
+  caches its bitset per segment core; a fresh producer per query would
+  recompute it on every search. `NestedQuery/parentFilter` gives the same for
+  the documents on one path."
+  (NestedQuery/rootsFilter))
 
 (defn- block-delete-query
   "What a delete matching `q` must become on an index holding nested documents.
@@ -677,7 +684,8 @@
   Matches only ROOTS, and each root takes its children with it. That is ES's
   rule — a single nested object cannot be deleted, only its root reindexed —
   and the only one that cannot orphan children. So a `q` that only children
-  can satisfy deletes nothing."
+  can satisfy deletes nothing. A root's children here are every document
+  between the previous root and it, so nested objects at every level go too."
   ^Query [^Query q]
   (let [roots (-> (BooleanQuery$Builder.)
                   (.add q BooleanClause$Occur/FILTER)
@@ -717,27 +725,92 @@
                     {:field nested-path-field})))
   (.addDocument ^BranchIndexWriter (->writer sw) doc))
 
+(defn- nested-path-of
+  "`doc`'s `nested-path-field` value: nil for a root, and ::malformed for a
+  document carrying the field more than once or without a string value."
+  [^Iterable doc]
+  (reduce (fn [path ^IndexableField field]
+            (cond
+              (not= nested-path-field (.name field)) path
+              (some? path) (reduced ::malformed)
+              :else (or (.stringValue field) ::malformed)))
+          nil
+          doc))
+
+(defn- path-line
+  "The paths above `path`, nearest first, ending in nil for the root:
+  \"a.b.c\" gives [\"a.b\" \"a\" nil]."
+  [^String path]
+  (loop [^String p path
+         line []]
+    (let [i (.lastIndexOf p ".")]
+      (if (pos? i)
+        (let [up (subs p 0 i)]
+          (recur up (conj line up)))
+        (conj line nil)))))
+
+(defn- misplaced-child
+  "The index of the first child in `paths` that a block join would give the
+  wrong parent, or nil when there is none.
+
+  `paths` is a block's `nested-path-field` values in document order, nil for a
+  root. A block join over the documents on path P takes, for a document below
+  P, the first P document after it. For that to be the child's own ancestor at
+  every level at once, its parent must be the FIRST document after it on its
+  line of ancestors. A grandparent's-path document coming first makes the
+  joins at the two levels disagree about whose child it is, and with no parent
+  before the root, the parent found is in another root's block. Post-order,
+  each object right after its own children, is the order `add-doc` writes,
+  and satisfies this."
+  [paths]
+  (loop [i (dec (count paths))
+         next-at {}]
+    (when-not (neg? i)
+      (let [path (nth paths i)]
+        (if (and path
+                 (let [[parent & above] (path-line path)
+                       at (get next-at parent)]
+                   (or (nil? at)
+                       (some #(when-let [sooner (get next-at %)] (< sooner at)) above))))
+          i
+          (recur (dec i) (assoc next-at path i)))))))
+
 (defn add-block
   "Add a pre-built block of Lucene documents: children first, root LAST.
 
   The typed counterpart of `add-document` for nested documents. The block goes
   in ONE `addDocuments` call, so it is contiguous and atomic. Every child
   carries `nested-path-field` (a StringField holding its path), and the root,
-  last, does not.
+  last, does not. A child with children of its own comes right after them, so
+  the block is its root's tree in post-order, as `add-doc` writes it:
+  `[reply reply comment reply comment root]`, the replies on
+  \"comments.replies\" and the comments on \"comments\".
 
   ANY OTHER SHAPE IS REFUSED BEFORE ANYTHING IS WRITTEN, because Lucene would
   accept it and nothing would report it. A child missing the field is a root to
   every query and delete: the children before it become ITS children, and it
   turns up in results as a root of its own. Children with no root after them
-  join the next root written, whoever's that is."
+  join the next root written, whoever's that is. A child whose parent does not
+  follow it, before any other of its ancestors' documents, joins some other
+  object's parent: a reply written after its comment belongs to the NEXT
+  comment, in this block or a later one."
   [sw docs]
-  (let [docs (vec docs)]
+  (let [docs (vec docs)
+        paths (mapv nested-path-of docs)]
     (when-not (and (seq docs)
-                   (not (child-doc? (peek docs)))
-                   (every? child-doc? (pop docs)))
+                   (nil? (peek paths))
+                   (every? #(and (string? %) (NestedQuery/isValidPath %)) (pop paths)))
       (throw (ex-info (str "scriptum: a block is its children, each carrying "
-                           nested-path-field ", then one root without it")
-                      {:shape (mapv #(if (child-doc? %) :child :root) docs)})))
+                           nested-path-field " (field names joined by \".\"), "
+                           "then one root without it")
+                      {:shape (mapv #(if (some? %) :child :root) paths)
+                       :paths paths})))
+    (when-let [i (misplaced-child paths)]
+      (throw (ex-info (str "scriptum: block document " i ", on " (nth paths i)
+                           ", is not followed by its parent before any other of its"
+                           " ancestors' documents; write each object right after"
+                           " its own children")
+                      {:index i :paths paths})))
     (.addDocuments ^BranchIndexWriter (->writer sw) ^Iterable docs)))
 
 (defn- add-field!
@@ -831,32 +904,57 @@
       (add-field! doc fname value-or-opts))
     doc))
 
-(defn- child-documents
-  "The documents of one `:nested` field's children: each child map's fields
-  under `<path>.<name>`, as ES names them, plus `nested-path-field`."
-  [^String path children]
-  (when-not (or (nil? children)
-                (and (sequential? children) (every? map? children)))
-    (throw (ex-info "scriptum: a :nested field's :value must be a vector of maps"
-                    {:path path :value children})))
-  (mapv (fn [child]
-          (when (some nested-spec? (vals child))
-            (throw (ex-info "scriptum: nesting inside a nested object is not supported"
-                            {:path path :child child})))
-          (doto (->document (str path ".") child)
-            (.add (StringField. ^String nested-path-field path Field$Store/NO))))
-        children))
+(defn- nested-field-path
+  "The path of the `:nested` field `field-name` of an object on `prefix`, or
+  of a root when `prefix` is nil.
+
+  ONE NAME, ONE LEVEL, so a `:nested` field name may not contain a dot. A path
+  segment IS a nesting level: :comments.replies on a root would claim a
+  comments level that has no documents, and a nested query through it would
+  join those children to the next \"comments\" document written — another
+  object's, or another root's."
+  ^String [prefix field-name]
+  (let [fname (name field-name)]
+    (when-not (and (NestedQuery/isValidPath fname) (neg? (.indexOf fname ".")))
+      (throw (ex-info (str "scriptum: a :nested field name must be non-empty and contain no"
+                           " \".\" — each dot-separated segment of a nested path is one"
+                           " level, so nest the inner field inside the outer one's objects")
+                      {:field fname :under prefix})))
+    (if prefix (str prefix "." fname) fname)))
+
+(defn- nested-documents
+  "The documents of the `:nested` fields of `doc-map`, an object on `prefix`
+  (nil for a root), in POST-ORDER: for each such field in doc-map order, each
+  child's own nested documents, then the child. A child is its map's fields
+  under `<path>.<name>`, as ES names them (\"comments.replies.author\"), plus
+  `nested-path-field`."
+  [prefix doc-map]
+  (into []
+        (mapcat (fn [[field-name value-or-opts]]
+                  (when (nested-spec? value-or-opts)
+                    (let [path (nested-field-path prefix field-name)
+                          children (:value value-or-opts)]
+                      (when-not (or (nil? children)
+                                    (and (sequential? children) (every? map? children)))
+                        (throw (ex-info (str "scriptum: a :nested field's :value must be"
+                                             " a vector of maps")
+                                        {:path path :value children})))
+                      (mapcat (fn [child]
+                                (conj (nested-documents path child)
+                                      (doto (->document (str path ".") child)
+                                        (.add (StringField. ^String nested-path-field path
+                                                            Field$Store/NO)))))
+                              children)))))
+        doc-map))
 
 (defn- ->block
-  "The documents `doc-map` is indexed as: the children of each `:nested` field,
-  in doc-map order, then the root. A single document when there are none."
+  "The documents `doc-map` is indexed as: its nested objects at every level,
+  in post-order, then the root. A single document when there are none.
+
+  Built whole before anything is written, so a refusal anywhere in the tree
+  writes nothing."
   [doc-map]
-  (conj (into []
-              (mapcat (fn [[field-name value-or-opts]]
-                        (when (nested-spec? value-or-opts)
-                          (child-documents (name field-name) (:value value-or-opts)))))
-              doc-map)
-        (->document nil doc-map)))
+  (conj (nested-documents nil doc-map) (->document nil doc-map)))
 
 (defn add-doc
   "Add a document to the branch.
@@ -900,13 +998,19 @@
     (add-doc writer {:title \"Post\"
                      :comments {:type :nested
                                 :value [{:author {:value \"alice\" :type :string}
-                                         :stars {:value 5 :type :int}}]}})
+                                         :stars {:value 5 :type :int}
+                                         :replies {:type :nested
+                                                   :value [{:author {:value \"bob\"
+                                                                     :type :string}}]}}]}})
 
-  A child map takes the same field specs as a doc-map, and its fields are
-  named `<path>.<name>` (\"comments.author\"). The children are written before
-  their root in one atomic block. A `:nested` field inside a child throws:
-  only one level is supported. Nothing returns a child's stored fields yet (ES's
-  inner hits), so keep whatever a result must show on the root.
+  A child map takes the same field specs as a doc-map, `:nested` included, to
+  any depth. A child's path joins the `:nested` field names above it with dots
+  (\"comments.replies\"), and its fields are named `<path>.<name>`
+  (\"comments.replies.author\"), as in ES. So a `:nested` field name may not
+  itself contain a dot. The whole tree is written before its root in one
+  atomic block, each object right after its own children. Nothing returns a
+  child's stored fields yet (ES's inner hits), so keep whatever a result must
+  show on the root.
 
   For fine-grained control, use Lucene classes directly:
     (let [doc (Document.)]
@@ -1316,8 +1420,8 @@
     (.build builder)))
 
 (defn nested-query
-  "Match the roots that have a child under `path` matching `child-query` —
-  ES's `nested` query.
+  "Match the documents that have a child under `path` matching `child-query` —
+  ES's `nested` query. At top level those are roots.
 
   `child-query` is a Lucene Query or `{:term [field value]}`, over the
   children's fully qualified field names (\"comments.author\"). Because every
@@ -1325,8 +1429,32 @@
   root only when a single child satisfies both — the cross-object false
   positive a flattened field cannot avoid.
 
+  `path` is a nested field's path, its levels joined by dots: \"comments\", or
+  \"comments.replies\" (also :comments.replies) for the :replies objects inside
+  each comment.
+
+  NESTING. As in ES, a nested query inside another one's `child-query` joins to
+  THAT query's objects, and a top-level one joins to roots. So
+
+    (nested-query :comments
+                  (bool-query [[{:term [:comments.author \"alice\"]} :filter]
+                               [(nested-query :comments.replies
+                                              {:term [:comments.replies.author \"bob\"]})
+                                :filter]]))
+
+  finds posts with a comment by alice that has a reply by bob, while a
+  top-level nested query on \"comments.replies\" finds posts with a reply by bob
+  under any comment. The inner path may skip levels (\"a.b.c\" inside \"a\").
+  It must be under the enclosing path, and the inner query must sit in the
+  enclosing one's child query only through bool, boost, constant-score or
+  dis-max queries, which are rebuilt around the rebound inner query; anything
+  else throws IllegalArgumentException rather than join it to the wrong level.
+
+  Returns an `org.replikativ.scriptum.NestedQuery`, which becomes Lucene's
+  ToParentBlockJoinQuery when a search rewrites it.
+
   Options:
-    :score-mode - how the matching children's scores become the root's:
+    :score-mode - how the matching children's scores become the parent's:
                   :avg (default, as in ES), :max, :min, :sum or :none
 
   Example:
@@ -1344,16 +1472,11 @@
                 :sum ScoreMode/Total
                 :none ScoreMode/None
                 (throw (ex-info "scriptum: :score-mode must be :avg, :max, :min, :sum or :none"
-                                {:score-mode score-mode})))
-         ;; ToParentBlockJoinQuery requires that its child query never match
-         ;; a root. The path filter guarantees it whatever `child-query` is,
-         ;; and keeps a query under one path from matching another's children.
-         children (-> (BooleanQuery$Builder.)
-                      (.add (clause->query child-query) BooleanClause$Occur/MUST)
-                      (.add (TermQuery. (Term. ^String nested-path-field ^String path))
-                            BooleanClause$Occur/FILTER)
-                      (.build))]
-     (ToParentBlockJoinQuery. children roots-bitset mode))))
+                                {:score-mode score-mode})))]
+     (when-not (NestedQuery/isValidPath path)
+       (throw (ex-info "scriptum: a nested path is non-empty field names joined by \".\""
+                       {:path path})))
+     (NestedQuery. path (clause->query child-query) ^ScoreMode mode))))
 
 ;; --- Search ---
 

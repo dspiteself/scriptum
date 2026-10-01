@@ -1,6 +1,7 @@
 (ns scriptum.nested-test
   "Pins Elasticsearch-style nested documents: Lucene block joins, children
-  first and their root last.
+  first and their root last, and nested objects inside nested objects, each
+  right after its own children.
 
   Block joins need nothing from scriptum's storage — fork, forceMerge,
   merge-from! and the konserve paths all carry a block through unchanged. What
@@ -10,8 +11,10 @@
   and a nested query answers for a document that never had them. CheckJoinIndex
   passes again by then, so it is run after every mutation here, while the split
   is still visible: a deleted root with a live child is exactly what it
-  reports."
+  reports. Alongside it runs the same check for every inner level, which
+  CheckJoinIndex cannot make (see `segment-structure`)."
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [konserve.store :as kstore]
             [scriptum.core :as sc])
@@ -21,10 +24,15 @@
            [java.time Instant]
            [org.apache.lucene.document Document Field$Store IntField LongField
             StringField]
-           [org.apache.lucene.index IndexReader Term]
-           [org.apache.lucene.search MatchAllDocsQuery TermQuery]
-           [org.apache.lucene.search.join CheckJoinIndex]
-           [org.replikativ.scriptum BranchIndexWriter]))
+           [org.apache.lucene.index IndexReader LeafReader LeafReaderContext
+            PostingsEnum Term Terms TermsEnum]
+           [org.apache.lucene.search BoostQuery ConstantScoreQuery DisjunctionMaxQuery
+            DocIdSetIterator IndexOrDocValuesQuery IndexSearcher MatchAllDocsQuery
+            Query TermQuery]
+           [org.apache.lucene.search.join CheckJoinIndex ScoreMode ToChildBlockJoinQuery
+            ToParentBlockJoinQuery]
+           [org.apache.lucene.util Bits BytesRef]
+           [org.replikativ.scriptum BranchIndexWriter NestedQuery]))
 
 (def ^:dynamic *root* nil)
 
@@ -53,11 +61,93 @@
 
 ;; --- Block integrity ---
 
+(defn- segment-paths
+  "Each document's nested path in `leaf`, in doc-id order; nil for a root.
+
+  Read from the terms index, since `_nested_path` is not stored. Postings keep
+  a deleted document until a merge drops it, so deleted documents have their
+  paths too, and a child's liveness can be compared with its parent's."
+  [^LeafReader leaf]
+  (let [paths (object-array (.maxDoc leaf))]
+    (when-let [^Terms terms (.terms leaf sc/nested-path-field)]
+      (let [^TermsEnum terms-enum (.iterator terms)]
+        (loop []
+          (when-let [^BytesRef term (.next terms-enum)]
+            (let [path (.utf8ToString term)
+                  ^PostingsEnum postings (.postings terms-enum nil (int PostingsEnum/NONE))]
+              (loop []
+                (let [doc (.nextDoc postings)]
+                  (when (not= doc DocIdSetIterator/NO_MORE_DOCS)
+                    (aset paths doc path)
+                    (recur)))))
+            (recur)))))
+    (vec paths)))
+
+(defn- path-line
+  "The paths above `path`, nearest first, ending in nil for the root."
+  [^String path]
+  (let [i (.lastIndexOf path ".")]
+    (if (pos? i)
+      (let [up (subs path 0 i)]
+        (cons up (path-line up)))
+      [nil])))
+
+(defn- segment-structure
+  "nil when, in one segment's `paths`, every child is followed by its parent
+  before any other of its ancestors' documents and is live exactly when that
+  parent is; otherwise what is wrong.
+
+  CheckJoinIndex for every level at once. CheckJoinIndex itself takes one
+  parents filter for the whole index, and only the roots' fits every segment:
+  with the documents on \"comments\" as the parents, a segment ending in a
+  root fails it. A block join over the documents on any path P takes, for a
+  document below P, the first P document after it, so this order is exactly
+  what makes every level's join find the right ancestor."
+  [paths live?]
+  (let [n (count paths)]
+    (cond
+      (zero? n) nil
+      (some? (peek paths)) (str "the last document, " (dec n) ", is a child on " (peek paths))
+      :else
+      (loop [i (dec n)
+             next-at {}]
+        (when-not (neg? i)
+          (let [path (nth paths i)]
+            (if (nil? path)
+              (recur (dec i) (assoc next-at nil i))
+              (let [[parent & above] (path-line path)
+                    at (get next-at parent)
+                    sooner (when at
+                             (some #(when-let [k (get next-at %)] (when (< k at) [% k]))
+                                   above))]
+                (cond
+                  (nil? at)
+                  (format "child %d on %s has no parent on %s after it"
+                          i path (or parent "the roots"))
+
+                  sooner
+                  (format "child %d on %s meets %s at %d before its parent at %d"
+                          i path (or (first sooner) "a root") (second sooner) at)
+
+                  (not= (live? i) (live? at))
+                  (format "child %d on %s is %s but its parent %d is not"
+                          i path (if (live? i) "live" "deleted") at)
+
+                  :else
+                  (recur (dec i) (assoc next-at path i)))))))))))
+
 (defn- block-integrity
-  "`:intact`, or CheckJoinIndex's description of the first split block."
+  "`:intact`, or a description of the first split or misordered block: by
+  CheckJoinIndex over the roots, then by `segment-structure` at every level."
   [^IndexReader reader]
   (try (CheckJoinIndex/check reader sc/roots-bitset)
-       :intact
+       (or (some (fn [^LeafReaderContext ctx]
+                   (let [leaf (.reader ctx)
+                         ^Bits live (.getLiveDocs leaf)]
+                     (segment-structure (segment-paths leaf)
+                                        #(or (nil? live) (.get live (int %))))))
+                 (.leaves reader))
+           :intact)
        (catch IllegalStateException e (.getMessage e))))
 
 (defn- assert-blocks-intact [reader]
@@ -871,24 +961,45 @@
       (finally (sc/close! source)))))
 
 ;; =============================================================================
-;; Shapes phase 1 does not accept, and the pre-built path
+;; Shapes that are refused, and the pre-built path
 ;; =============================================================================
 
-(deftest multi-level-nesting-is-refused
-  (let [w (sc/create-index (under "idx") "main")
-        doc {:id {:value "p" :type :string}
-             :comments {:type :nested
-                        :value [{:author {:value "a" :type :string}
-                                 :replies {:type :nested
-                                           :value [{:author {:value "b"
-                                                             :type :string}}]}}]}}]
-    (try
-      (is (thrown? ExceptionInfo (sc/add-doc w doc)))
-      (is (thrown? ExceptionInfo (sc/update-doc w "id" "p" doc)))
-      (sc/commit! w)
-      (is (= 0 (sc/num-docs w))
-          "the block is refused whole, not written up to the child that failed")
-      (finally (sc/close! w)))))
+(deftest a-dotted-nested-field-name-is-refused
+  (testing "a path segment IS a nesting level, so a :nested name with a dot
+            would claim a level that has no documents; a nested query through
+            it would join these children to some other object's"
+    (let [w (sc/create-index (under "idx") "main")
+          reply {:author {:value "b" :type :string}}
+          on-root {:id {:value "p" :type :string}
+                   :comments.replies {:type :nested :value [reply]}}
+          in-child {:id {:value "p" :type :string}
+                    :comments {:type :nested
+                               :value [{:author {:value "a" :type :string}
+                                        :replies.likes {:type :nested
+                                                        :value [reply]}}]}}
+          likes {:likes {:type :nested :value ["not a map"]}}
+          deep-bad-value {:id {:value "p" :type :string}
+                          :comments {:type :nested
+                                     :value [{:replies {:type :nested :value [likes]}}]}}]
+      (try
+        (doseq [[label doc] [["on a root" on-root]
+                             ["in a child" in-child]
+                             ["an empty name" {:id {:value "p" :type :string}
+                                               (keyword "") {:type :nested :value [reply]}}]]]
+          (testing label
+            (is (thrown-with-msg? ExceptionInfo #"contain no \"\.\"" (sc/add-doc w doc)))
+            (is (thrown? ExceptionInfo (sc/update-doc w "id" "p" doc)))))
+        (testing "a refusal three levels down"
+          (is (thrown? ExceptionInfo (sc/add-doc w deep-bad-value))))
+        (testing "a dotted name that is not :nested is a field name like any other"
+          (sc/add-doc w {:id {:value "flat" :type :string}
+                         :meta.source {:value "import" :type :string}})
+          (is (= ["flat"] (search-ids w {:term [:meta.source "import"]}))))
+        (sc/commit! w)
+        (is (= 1 (sc/num-docs w))
+            "every refused block was refused whole, not written up to the child that failed")
+        (is (not (latched? w)))
+        (finally (sc/close! w))))))
 
 (deftest a-prebuilt-block-is-a-nested-root
   (let [w (sc/create-index (under "idx") "main")
@@ -951,3 +1062,764 @@
         (is (= ["r2"] (by-author "bob")))
         (is (= ["r2"] (search-ids w :all)))
         (finally (sc/close! w))))))
+
+;; =============================================================================
+;; Nested objects inside nested objects
+;; =============================================================================
+
+(defn- reply-spec [author]
+  {:author {:value author :type :string}})
+
+(defn- thread-comment
+  "A :comments child by `author`, with one :replies child per reply author."
+  [[author & replies]]
+  {:author {:value author :type :string}
+   :replies {:type :nested :value (mapv reply-spec replies)}})
+
+(defn- thread
+  "A root with one :comments child per [author & reply-authors]."
+  [id comments]
+  {:id {:value id :type :string}
+   :title {:value id :type :string}
+   :comments {:type :nested :value (mapv thread-comment comments)}})
+
+(def ^:private seed-threads
+  "t2 has a comment by alice and a reply by bob, but bob replied to carol —
+  the post a nested query on replies inside one on comments must not find,
+  and two nested queries side by side do."
+  [["t1" [["alice" "bob"] ["carol"]]]
+   ["t2" [["alice" "dave"] ["carol" "bob"]]]
+   ["t3" [["erin"]]]
+   ["t4" [["bob" "alice"]]]])
+
+(def ^:private seed-thread-doc-count
+  "t1 4, t2 5, t3 2, t4 3: roots, comments and replies."
+  14)
+
+(defn- seed-threads! [w threads]
+  (doseq [[id comments] threads]
+    (sc/add-doc w (thread id comments))))
+
+(defn- replies-by
+  "A nested query on replies by `author`; joined to roots at top level, to
+  comments inside a nested query on comments."
+  ([author] (replies-by author {}))
+  ([author opts]
+   (sc/nested-query :comments.replies {:term [:comments.replies.author author]} opts)))
+
+(defn- comment-replied
+  "Posts with a comment by `author` that has a reply by `replier`: the reply
+  query inside the comment query, so both hold for ONE comment."
+  ([author replier] (comment-replied author replier {}))
+  ([author replier opts]
+   (sc/nested-query :comments
+                    (sc/bool-query [[{:term [:comments.author author]} :filter]
+                                    [(replies-by replier) :filter]])
+                    opts)))
+
+(defn- inner-nested
+  "The NestedQuery among `q`'s child query's clauses."
+  ^NestedQuery [^NestedQuery q]
+  (some #(when (instance? NestedQuery %) %)
+        (map #(.query ^org.apache.lucene.search.BooleanClause %)
+             (.clauses ^org.apache.lucene.search.BooleanQuery (.getChildQuery q)))))
+
+(deftest a-nested-query-inside-a-nested-query-joins-to-its-objects
+  (testing "ES semantics: the inner query's parents are the enclosing query's
+            objects, so the reply must be under the SAME comment"
+    (let [w (sc/create-index (under "idx") "main")]
+      (try
+        (seed-threads! w seed-threads)
+        (sc/commit! w)
+        (assert-writer-blocks-intact w)
+        (is (= seed-thread-doc-count (sc/num-docs w)))
+        (is (= ["t1"] (search-ids w (comment-replied "alice" "bob")))
+            "t2 has alice's comment and bob's reply, but bob replied to carol")
+        (is (= ["t1" "t2"]
+               (search-ids w (sc/bool-query [[(sc/nested-query
+                                               :comments {:term [:comments.author "alice"]})
+                                              :filter]
+                                             [(replies-by "bob") :filter]])))
+            "side by side, the two conditions may hold in different comments")
+        (is (= ["t2"] (search-ids w (comment-replied "carol" "bob"))))
+        (is (= ["t4"] (search-ids w (comment-replied "bob" "alice"))))
+        (is (= [] (search-ids w (comment-replied "erin" "bob"))))
+        (testing "a top-level nested query on a deeper path joins to roots"
+          (is (= ["t1" "t2"] (search-ids w (replies-by "bob"))))
+          (is (= ["t4"] (search-ids w (replies-by "alice"))))
+          (is (= [] (search-ids w (replies-by "erin"))) "erin wrote a comment, not a reply")
+          (is (= [] (search-ids w (sc/nested-query :comments
+                                                   {:term [:comments.replies.author "bob"]})))
+              "each level's query matches that level's documents only"))
+        (testing "an inner query under :must-not: comments by carol with no reply by bob"
+          (is (= ["t1"]
+                 (search-ids w (sc/nested-query
+                                :comments
+                                (sc/bool-query [[{:term [:comments.author "carol"]} :filter]
+                                                [(replies-by "bob") :must-not]]))))))
+        (testing "the binding is data on the query"
+          (let [inner (replies-by "bob")
+                outer (comment-replied "alice" "bob")]
+            (is (nil? (.getParentPath ^NestedQuery inner)) "top level: the roots")
+            (is (= "comments" (.getParentPath (inner-nested outer))))
+            (is (= "comments.replies" (.getPath (inner-nested outer))))
+            (let [built-on (sc/nested-query :comments
+                                            (sc/bool-query
+                                             [[{:term [:comments.author "alice"]} :filter]
+                                              [inner :filter]]))]
+              (is (= outer built-on))
+              (is (nil? (.getParentPath ^NestedQuery inner))
+                  "binding builds a new query and leaves the one it was given alone"))))
+        (testing "every score mode, at either level, matches the same roots"
+          (doseq [outer [:avg :max :min :sum :none]
+                  inner [:avg :max :min :sum :none]]
+            (is (= ["t1"]
+                   (search-ids w (sc/nested-query
+                                  :comments
+                                  (sc/bool-query [[{:term [:comments.author "alice"]} :must]
+                                                  [(replies-by "bob" {:score-mode inner}) :must]])
+                                  {:score-mode outer})))
+                (str outer " over " inner))))
+        (is (= [] (search-ids w {:term [:comments.replies.author "bob"]}))
+            "a reply is a child like any other: no ordinary query returns it")
+        (finally (sc/close! w))))))
+
+(defn- tree
+  "A root whose :a objects each hold :b objects, each holding :c objects:
+  `as` is [[a-name [[b-name [c-value ...]] ...]] ...]."
+  [id as]
+  (let [nested (fn [f xs] {:type :nested :value (mapv f xs)})
+        c (fn [v] {:v {:value v :type :string}})
+        b (fn [[b-name cs]] {:name {:value b-name :type :string} :c (nested c cs)})
+        a (fn [[a-name bs]] {:name {:value a-name :type :string} :b (nested b bs)})]
+    {:id {:value id :type :string}
+     :a (nested a as)}))
+
+(def ^:private seed-trees
+  [["R1" [["a1" [["b1" ["x"]] ["b2" ["y"]]]]
+          ["a2" [["b1" ["y"]]]]]]
+   ["R2" [["a1" [["b1" ["y"]]]]
+          ["a2" [["b2" ["x"]]]]]]
+   ["R3" [["a1" [["b2" ["x" "y"]]]]]]])
+
+(defn- tree-q
+  "Roots with an a named `a` holding a b named `b` holding a c with value `v`:
+  three levels, each nested in the one above."
+  [a b v]
+  (sc/nested-query
+   :a (sc/bool-query
+       [[{:term [:a.name a]} :filter]
+        [(sc/nested-query
+          :a.b (sc/bool-query
+                [[{:term [:a.b.name b]} :filter]
+                 [(sc/nested-query :a.b.c {:term [:a.b.c.v v]}) :filter]]))
+         :filter]])))
+
+(defn- skip-q
+  "Roots with an a named `a` holding, at any b, a c with value `v`: the c query
+  directly inside the a query, skipping the b level."
+  [a v]
+  (sc/nested-query :a (sc/bool-query [[{:term [:a.name a]} :filter]
+                                      [(sc/nested-query :a.b.c {:term [:a.b.c.v v]})
+                                       :filter]])))
+
+(deftest nesting-goes-three-levels-deep-and-may-skip-one
+  (let [w (sc/create-index (under "idx") "main")]
+    (try
+      (doseq [[id as] seed-trees]
+        (sc/add-doc w (tree id as)))
+      (sc/commit! w)
+      (assert-writer-blocks-intact w)
+      (is (= 21 (sc/num-docs w)) "R1 1+2+3+3, R2 1+2+2+2, R3 1+1+1+2")
+      (testing "every level's condition holds along one chain of objects"
+        (is (= ["R1"] (search-ids w (tree-q "a1" "b1" "x"))))
+        (is (= ["R3"] (search-ids w (tree-q "a1" "b2" "x"))))
+        (is (= ["R1" "R3"] (search-ids w (tree-q "a1" "b2" "y"))))
+        (is (= ["R2"] (search-ids w (tree-q "a2" "b2" "x"))))
+        (is (= [] (search-ids w (tree-q "a2" "b1" "x")))
+            "R1 has a2/b1 and a1/b1/x, and R2 a2/b2/x, but no a2/b1/x"))
+      (testing "the c query inside the a query joins each c to its own a"
+        (let [q (skip-q "a1" "x")]
+          (is (= "a" (.getParentPath (inner-nested q))))
+          (is (= ["R1" "R3"] (search-ids w q))))
+        (is (= ["R2"] (search-ids w (skip-q "a2" "x")))
+            "R1's a2 holds only y, and its x is under a1")
+        (is (= ["R1" "R2" "R3"] (search-ids w (skip-q "a1" "y")))))
+      (testing "a top-level query two levels down joins straight to the roots"
+        (is (= ["R1" "R2" "R3"]
+               (search-ids w (sc/nested-query :a.b.c {:term [:a.b.c.v "x"]})))))
+      (testing "a top-level query one level down, with a nested query inside it"
+        (is (= ["R2" "R3"]
+               (search-ids w (sc/nested-query
+                              :a.b (sc/bool-query
+                                    [[{:term [:a.b.name "b2"]} :filter]
+                                     [(sc/nested-query :a.b.c {:term [:a.b.c.v "x"]})
+                                      :filter]]))))))
+      (finally (sc/close! w)))))
+
+(deftest a-doc-map-is-written-in-post-order
+  (testing "each object right after its own children, several nested fields
+            per level in doc-map order, the root last"
+    (let [w (sc/create-index (under "idx") "main")
+          who (fn [v] {:by {:value v :type :string}})]
+      (try
+        (sc/add-doc w {:id {:value "d" :type :string}
+                       :comments {:type :nested
+                                  :value [{:by {:value "c1" :type :string}
+                                           :replies {:type :nested
+                                                     :value [(who "r1") (who "r2")]}
+                                           :likes {:type :nested :value [(who "l1")]}}
+                                          {:by {:value "c2" :type :string}
+                                           :likes {:type :nested :value [(who "l2")]}}]}
+                       :reviews {:type :nested
+                                 :value [{:by {:value "v1" :type :string}
+                                          :notes {:type :nested :value [(who "n1")]}}]}})
+        (sc/commit! w)
+        (with-open [r (sc/snapshot w)]
+          (assert-blocks-intact r)
+          (is (= [["comments.replies" "comments.replies" "comments.likes" "comments"
+                   "comments.likes" "comments"
+                   "reviews.notes" "reviews"
+                   nil]]
+                 (mapv #(segment-paths (.reader ^LeafReaderContext %)) (.leaves r)))))
+        (let [under-comment (fn [c path v]
+                              (search-ids w (sc/nested-query
+                                             :comments
+                                             (sc/bool-query
+                                              [[{:term [:comments.by c]} :filter]
+                                               [(sc/nested-query
+                                                 path {:term [(str path ".by") v]})
+                                                :filter]]))))]
+          (is (= ["d"] (under-comment "c1" "comments.replies" "r2")))
+          (is (= ["d"] (under-comment "c1" "comments.likes" "l1")))
+          (is (= ["d"] (under-comment "c2" "comments.likes" "l2")))
+          (is (= [] (under-comment "c2" "comments.likes" "l1")) "l1 is c1's")
+          (is (= [] (under-comment "c2" "comments.replies" "r1")) "c2 has no replies")
+          (is (= ["d"] (search-ids w (sc/nested-query
+                                      :reviews
+                                      (sc/bool-query
+                                       [[{:term [:reviews.by "v1"]} :filter]
+                                        [(sc/nested-query :reviews.notes
+                                                          {:term [:reviews.notes.by "n1"]})
+                                         :filter]]))))))
+        (finally (sc/close! w))))))
+
+(deftest binding-refuses-what-it-cannot-join
+  (let [inner (replies-by "bob")
+        in-comments #(sc/nested-query :comments %)]
+    (testing "an inner path must be under the enclosing one"
+      (doseq [[label path] [["another field" "reviews.replies"]
+                            ["the same path" "comments"]
+                            ["a longer field name, not a deeper level" "commentsx.replies"]]]
+        (testing label
+          (is (thrown-with-msg?
+               IllegalArgumentException
+               (re-pattern (str "\"" (java.util.regex.Pattern/quote path) "\".*\"comments\""))
+               (in-comments (sc/nested-query path {:term [:x "y"]}))))))
+      (testing "a level above"
+        (is (thrown-with-msg?
+             IllegalArgumentException #"\"comments\".*\"comments.replies\""
+             (sc/nested-query :comments.replies
+                              (sc/nested-query :comments {:term [:x "y"]}))))))
+    (testing "a nested query reached through a query binding cannot rebuild
+              throws, rather than staying joined to the roots"
+      (doseq [[label wrapper] [["IndexOrDocValuesQuery" (IndexOrDocValuesQuery. inner inner)]
+                               ["a block join, which visits as a leaf"
+                                (ToParentBlockJoinQuery. inner sc/roots-bitset ScoreMode/None)]
+                               ["a child block join"
+                                (ToChildBlockJoinQuery. inner sc/roots-bitset)]
+                               ["under a :must-not, inside one"
+                                (IndexOrDocValuesQuery.
+                                 (sc/bool-query [[(MatchAllDocsQuery.) :filter]
+                                                 [inner :must-not]])
+                                 (MatchAllDocsQuery.))]]]
+        (testing label
+          (is (thrown-with-msg? IllegalArgumentException #"binding cannot see through"
+                                (in-comments (sc/bool-query [[{:term [:comments.author "alice"]}
+                                                              :filter]
+                                                             [wrapper :filter]])))))))
+    (testing "malformed paths"
+      (doseq [path ["" "." ".comments" "comments." "comments..replies"]]
+        (is (thrown? ExceptionInfo (sc/nested-query path {:term [:x "y"]})) (pr-str path))
+        (is (thrown? IllegalArgumentException
+                     (NestedQuery. path (MatchAllDocsQuery.) ScoreMode/Avg))
+            (pr-str path)))
+      (is (thrown? IllegalArgumentException
+                   (NestedQuery. "comments.replies" (MatchAllDocsQuery.) ScoreMode/Avg
+                                 "replies" nil))
+          "an explicit parent path must be above the path")
+      (is (thrown? IllegalArgumentException (NestedQuery/parentFilter "comments."))))))
+
+(deftest supported-wrappers-are-rebuilt-around-the-bound-query
+  (let [w (sc/create-index (under "idx") "main")]
+    (try
+      (seed-threads! w seed-threads)
+      (sc/commit! w)
+      (doseq [[label wrap] [["boost" #(BoostQuery. % 2.0)]
+                            ["constant score" #(ConstantScoreQuery. %)]
+                            ["dis-max" #(DisjunctionMaxQuery. [% (replies-by "zed")] 0.1)]
+                            ["all three, in a bool"
+                             #(sc/bool-query [[(BoostQuery.
+                                                (ConstantScoreQuery.
+                                                 (DisjunctionMaxQuery. [% (replies-by "zed")]
+                                                                       0.0))
+                                                3.0)
+                                               :must]])]]]
+        (testing label
+          (is (= ["t1"]
+                 (search-ids w (sc/nested-query
+                                :comments
+                                (sc/bool-query [[{:term [:comments.author "alice"]} :filter]
+                                                [(wrap (replies-by "bob")) :must]])))))))
+      (testing "at top level any wrapper will do: the roots are the parents either way"
+        (is (= ["t1" "t2"] (search-ids w (IndexOrDocValuesQuery. (replies-by "bob")
+                                                                 (replies-by "bob"))))))
+      (finally (sc/close! w)))))
+
+(deftest a-nested-query-is-a-value
+  (testing "equal when built alike, so a continuation can recognize its query"
+    (is (= (comment-replied "alice" "bob") (comment-replied "alice" "bob")))
+    (is (= (hash (comment-replied "alice" "bob")) (hash (comment-replied "alice" "bob"))))
+    (doseq [[label other] [["another value" (comment-replied "alice" "dave")]
+                           ["another outer score mode"
+                            (comment-replied "alice" "bob" {:score-mode :max})]
+                           ["another inner score mode"
+                            (sc/nested-query :comments
+                                             (sc/bool-query
+                                              [[{:term [:comments.author "alice"]} :filter]
+                                               [(replies-by "bob" {:score-mode :sum}) :filter]]))]]]
+      (is (not= (comment-replied "alice" "bob") other) label))
+    (let [child (TermQuery. (Term. "comments.replies.author" "bob"))]
+      (is (not= (NestedQuery. "comments.replies" child ScoreMode/Avg)
+                (NestedQuery. "comments.replies" child ScoreMode/Avg "comments" nil))
+          "the parent path")
+      (is (= (NestedQuery. "comments.replies" child ScoreMode/Avg "comments" {:size 3})
+             (NestedQuery. "comments.replies" child ScoreMode/Avg "comments" {:size 3})))
+      (is (not= (NestedQuery. "comments.replies" child ScoreMode/Avg "comments" {:size 3})
+                (NestedQuery. "comments.replies" child ScoreMode/Avg "comments" nil))
+          "inner hits")))
+  (testing "it rewrites to the block join, over one shared parents filter per level"
+    (is (identical? sc/roots-query (NestedQuery/rootsQuery)))
+    (is (identical? sc/roots-bitset (NestedQuery/rootsFilter)))
+    (is (identical? sc/roots-bitset (NestedQuery/parentFilter nil)))
+    (is (identical? (NestedQuery/parentFilter "comments") (NestedQuery/parentFilter "comments")))
+    (let [w (sc/create-index (under "idx") "main")]
+      (try
+        (seed-threads! w seed-threads)
+        (sc/commit! w)
+        (with-open [r (sc/snapshot w)]
+          (let [searcher (IndexSearcher. r)
+                q (inner-nested (comment-replied "alice" "bob"))
+                ^ToParentBlockJoinQuery join (.rewrite ^NestedQuery q searcher)]
+            (is (instance? ToParentBlockJoinQuery join))
+            (is (= (.childLevelQuery ^NestedQuery q) (.getChildQuery join)))
+            (is (= (ToParentBlockJoinQuery. (.childLevelQuery ^NestedQuery q)
+                                            (NestedQuery/parentFilter "comments")
+                                            ScoreMode/Avg)
+                   join))
+            (is (= 2 (.count searcher (replies-by "bob"))) "IndexSearcher rewrites it first")))
+        (finally (sc/close! w))))))
+
+;; --- Writes on multi-level blocks ---
+
+(defn- whole-blocks
+  "The roots `q` matches and every document of their blocks, from public
+  pieces: what a BranchIndexWriter caller deletes to remove blocks whole."
+  ^Query [q]
+  (let [roots (sc/bool-query [[q :filter] [sc/roots-query :filter]])]
+    (sc/bool-query [[roots :should]
+                    [(ToChildBlockJoinQuery. roots sc/roots-bitset) :should]])))
+
+(defn- prebuilt-nested
+  "A child on `path` built by hand, with `by` under `<path>.by`."
+  ^Document [^String path ^String by]
+  (doto (Document.)
+    (.add (StringField. sc/nested-path-field path Field$Store/NO))
+    (.add (StringField. (str path ".by") by Field$Store/YES))))
+
+(deftest deleting-a-root-takes-its-whole-tree
+  (doseq [[label delete!] [["delete-docs" #(sc/delete-docs % "id" "t2")]
+                           ["delete-query" #(sc/delete-query % (TermQuery. (Term. "title" "t2")))]
+                           ;; Lucene's delete path rewrites the query, so the
+                           ;; NestedQuery becomes its block join there too.
+                           ["delete-query by a nested query inside a nested query"
+                            #(sc/delete-query % (comment-replied "carol" "bob"))]
+                           ["BranchIndexWriter.deleteDocuments, the blocks a nested query finds"
+                            #(.deleteDocuments ^BranchIndexWriter (sc/->writer %)
+                                               ^"[Lorg.apache.lucene.search.Query;"
+                                               (into-array Query [(whole-blocks
+                                                                   (comment-replied
+                                                                    "carol" "bob"))]))]]]
+    (testing label
+      (let [w (sc/create-index (under label) "main")]
+        (try
+          (seed-threads! w seed-threads)
+          (sc/commit! w)
+          (is (latched? w))
+          (delete! w)
+          (sc/commit! w)
+          (assert-writer-blocks-intact w)
+          (is (= ["t1" "t3" "t4"] (search-ids w :all)))
+          (is (= (- seed-thread-doc-count 5) (sc/num-docs w)) "t2, its comments and their replies")
+          (is (= [] (search-ids w (replies-by "dave"))))
+          (.forceMerge (sc/->writer w) 1)
+          (sc/commit! w)
+          (assert-writer-blocks-intact w)
+          (is (= [] (search-ids w (replies-by "dave"))) "t2's replies must not re-parent onto t3")
+          (is (= [] (search-ids w (comment-replied "carol" "bob"))))
+          (is (= ["t1"] (search-ids w (replies-by "bob"))))
+          (is (= ["t1"] (search-ids w (comment-replied "alice" "bob"))))
+          (is (= ["t4"] (search-ids w (comment-replied "bob" "alice"))))
+          (is (= (- seed-thread-doc-count 5) (sc/num-docs w)))
+          (finally (sc/close! w))))))
+  (testing "a value only a reply carries deletes nothing"
+    (let [w (sc/create-index (under "reply-only") "main")]
+      (try
+        (seed-threads! w seed-threads)
+        (sc/commit! w)
+        (sc/delete-docs w "comments.replies.author" "bob")
+        (sc/delete-query w (TermQuery. (Term. "comments.replies.author" "bob")))
+        (sc/commit! w)
+        (assert-writer-blocks-intact w)
+        (is (= ["t1" "t2" "t3" "t4"] (search-ids w :all)))
+        (is (= seed-thread-doc-count (sc/num-docs w)))
+        (is (= ["t1"] (search-ids w (comment-replied "alice" "bob"))))
+        (finally (sc/close! w))))))
+
+(deftest updating-a-root-replaces-its-whole-tree
+  (testing "update-doc"
+    (let [w (sc/create-index (under "update-doc") "main")]
+      (try
+        (seed-threads! w seed-threads)
+        (sc/commit! w)
+        (sc/update-doc w "id" "t1" (thread "t1" [["zoe" "yan" "xi"]]))
+        (sc/commit! w)
+        (assert-writer-blocks-intact w)
+        (is (= [] (search-ids w (comment-replied "alice" "bob"))))
+        (is (= ["t1"] (search-ids w (comment-replied "zoe" "xi"))))
+        (is (= ["t2"] (search-ids w (replies-by "bob"))) "t1's old reply went with it")
+        (is (= (+ seed-thread-doc-count -4 4) (sc/num-docs w)))
+        (sc/update-doc w "id" "t3" {:id {:value "t3" :type :string}})
+        (sc/commit! w)
+        (assert-writer-blocks-intact w)
+        (.forceMerge (sc/->writer w) 1)
+        (sc/commit! w)
+        (assert-writer-blocks-intact w)
+        (is (= ["t1" "t2" "t3" "t4"] (search-ids w :all)))
+        (is (= ["t1"] (search-ids w (comment-replied "zoe" "yan"))))
+        (is (= ["t2"] (search-ids w (comment-replied "carol" "bob"))))
+        (is (= [] (search-ids w (sc/nested-query :comments {:term [:comments.author "erin"]}))))
+        (is (= (+ seed-thread-doc-count -1) (sc/num-docs w)) "t3 lost its one comment")
+        (finally (sc/close! w)))))
+  (testing "BranchIndexWriter.updateDocuments, keyed by a nested query: Lucene
+            rewrites it on the delete side"
+    (let [w (sc/create-index (under "update-documents") "main")]
+      (try
+        (seed-threads! w seed-threads)
+        (sc/commit! w)
+        (let [^Iterable block [(prebuilt-nested "comments.replies" "kim")
+                               (prebuilt-nested "comments" "kai")
+                               (prebuilt-root "t1")]]
+          (.updateDocuments ^BranchIndexWriter (sc/->writer w)
+                            (whole-blocks (comment-replied "alice" "bob"))
+                            block))
+        (sc/commit! w)
+        (assert-writer-blocks-intact w)
+        (is (= ["t1" "t2" "t3" "t4"] (search-ids w :all)))
+        (is (= [] (search-ids w (comment-replied "alice" "bob"))))
+        (is (= ["t1"] (search-ids w (sc/nested-query
+                                     :comments
+                                     (sc/bool-query
+                                      [[{:term [:comments.by "kai"]} :filter]
+                                       [(sc/nested-query :comments.replies
+                                                         {:term [:comments.replies.by "kim"]})
+                                        :filter]])))))
+        (is (= (+ seed-thread-doc-count -4 3) (sc/num-docs w)))
+        (finally (sc/close! w))))))
+
+(deftest fork-and-merge-carry-multi-level-blocks
+  (let [main (sc/create-index (under "idx") "main")]
+    (try
+      (seed-threads! main (take 2 seed-threads))
+      (sc/commit! main)
+      (assert-writer-blocks-intact main)
+      (let [exp (sc/fork main "exp")]
+        (try
+          (is (latched? exp))
+          (sc/update-doc exp "id" "t1" (thread "t1" [["alice" "eve"] ["bob" "bob"]]))
+          (sc/add-doc exp (thread "t5" [["fay" "gil" "hal"]]))
+          (sc/commit! exp)
+          (assert-writer-blocks-intact exp)
+          (testing "the fork sees its blocks"
+            (is (= ["t1"] (search-ids exp (comment-replied "alice" "eve"))))
+            (is (= [] (search-ids exp (comment-replied "alice" "bob"))))
+            (is (= ["t1" "t2"] (search-ids exp (replies-by "bob"))))
+            (is (= ["t5"] (search-ids exp (comment-replied "fay" "hal")))))
+          (testing "the parent is unchanged"
+            (assert-writer-blocks-intact main)
+            (is (= ["t1"] (search-ids main (comment-replied "alice" "bob"))))
+            (is (= [] (search-ids main (comment-replied "alice" "eve"))))
+            (is (= 9 (sc/num-docs main))))
+          (testing "merge-from! brings them whole"
+            (sc/merge-from! main exp)
+            (assert-writer-blocks-intact main)
+            (is (= ["t1" "t1" "t2" "t2"]
+                   (search-ids main (sc/nested-query :comments
+                                                     {:term [:comments.author "alice"]})))
+                "add-only: main's t1 and t2, and exp's new t1 and its copy of t2")
+            (is (= ["t1"] (search-ids main (comment-replied "alice" "eve"))))
+            (is (= ["t5"] (search-ids main (comment-replied "fay" "gil"))))
+            (.forceMerge (sc/->writer main) 1)
+            (sc/commit! main)
+            (assert-writer-blocks-intact main)
+            (is (= ["t1"] (search-ids main (comment-replied "alice" "eve"))))
+            (is (= ["t1"] (search-ids main (comment-replied "alice" "bob"))))
+            (is (= ["t2" "t2"] (search-ids main (comment-replied "carol" "bob")))
+                "exp's copy of t2 arrived with its replies")
+            (is (= ["t5"] (search-ids main (comment-replied "fay" "hal")))))
+          (finally (sc/close! exp))))
+      (finally (sc/close! main)))))
+
+(deftest a-prebuilt-block-nests-in-post-order
+  (let [w (sc/create-index (under "idx") "main")
+        child prebuilt-nested
+        replied #(search-ids w (sc/nested-query
+                                :comments
+                                (sc/bool-query
+                                 [[{:term [:comments.by %1]} :filter]
+                                  [(sc/nested-query :comments.replies
+                                                    {:term [:comments.replies.by %2]})
+                                   :filter]])))]
+    (try
+      (testing "a child whose parent would not be found is refused"
+        (doseq [[label block] [["a reply after its comment"
+                                [(child "comments" "c") (child "comments.replies" "r")
+                                 (prebuilt-root "x")]]
+                               ["a reply with no comment"
+                                [(child "comments.replies" "r") (prebuilt-root "x")]]
+                               ["a grandparent's document before the parent"
+                                [(child "a.b.c" "c") (child "a" "a") (child "a.b" "b")
+                                 (prebuilt-root "x")]]
+                               ["an empty path segment"
+                                [(child "comments..replies" "r") (child "comments" "c")
+                                 (prebuilt-root "x")]]
+                               ["the field twice"
+                                [(doto (prebuilt-nested "comments" "c")
+                                   (.add (StringField. sc/nested-path-field "reviews"
+                                                       Field$Store/NO)))
+                                 (prebuilt-root "x")]]]]
+          (testing label
+            (is (thrown? ExceptionInfo (sc/add-block w block)))))
+        (is (not (latched? w)) "refused before the writer saw a document"))
+      (sc/add-block w [(child "comments.replies" "r1") (child "comments.replies" "r2")
+                       (child "comments" "c1")
+                       (child "comments" "c2")
+                       (child "comments.replies" "r3") (child "comments" "c3")
+                       (prebuilt-root "b1")])
+      (testing "an unrelated document between a child and its parent changes no join"
+        (sc/add-block w [(child "comments.replies" "r4") (child "reviews" "v")
+                         (child "comments" "c4") (prebuilt-root "b2")]))
+      (sc/commit! w)
+      (assert-writer-blocks-intact w)
+      (is (= ["b1"] (replied "c1" "r2")))
+      (is (= [] (replied "c2" "r3")) "c2 has no replies")
+      (is (= ["b1"] (replied "c3" "r3")))
+      (is (= ["b2"] (replied "c4" "r4")))
+      (is (= ["b2"] (search-ids w (sc/nested-query :reviews {:term [:reviews.by "v"]}))))
+      (finally (sc/close! w)))))
+
+(deftest the-integrity-check-sees-every-level
+  (testing "a reply with no comment after it in its block: CheckJoinIndex over
+            the roots passes, the per-level check does not, and a reply query
+            inside a comment query gives the reply to the NEXT root's comment"
+    (let [w (sc/create-index (under "idx") "main")]
+      (try
+        ;; Straight to BranchIndexWriter, past add-block's check.
+        (.addDocuments ^BranchIndexWriter (sc/->writer w)
+                       [(prebuilt-nested "comments" "c1")
+                        (prebuilt-nested "comments.replies" "r1")
+                        (prebuilt-root "b1")])
+        (sc/add-block w [(prebuilt-nested "comments" "c2") (prebuilt-root "b2")])
+        (sc/commit! w)
+        (.forceMerge (sc/->writer w) 1)
+        (sc/commit! w)
+        (with-open [r (sc/snapshot w)]
+          (is (nil? (CheckJoinIndex/check r sc/roots-bitset)) "CheckJoinIndex passes it")
+          (is (= "child 1 on comments.replies meets a root at 2 before its parent at 3"
+                 (block-integrity r))))
+        (is (= ["b1"] (search-ids w (sc/nested-query :comments.replies
+                                                     {:term [:comments.replies.by "r1"]})))
+            "joined to the roots, it is still b1's")
+        (is (= ["b2"] (search-ids w (sc/nested-query
+                                     :comments
+                                     (sc/bool-query
+                                      [[{:term [:comments.by "c2"]} :filter]
+                                       [(sc/nested-query :comments.replies
+                                                         {:term [:comments.replies.by "r1"]})
+                                        :filter]]))))
+            "joined to comments, it is c2's, in another root's block")
+        (finally (sc/close! w))))))
+
+;; --- Store-backed paths, multi-level ---
+
+(def ^:private reply-bodies ["hot" "hot hot" "hot and mild"])
+
+(defn- hot-comments
+  "Root `i`'s comments, as [[comment-body [reply-body ...]] ...]: 1 to 3
+  comments, warm or cool, with 1 to 3 replies each, hot or cold. Varied text
+  gives varied scores, so score order is exercised."
+  [i]
+  (vec (for [j (range (inc (mod i 3)))]
+         [(if (= (zero? j) (even? (quot i 3))) "warm" "cool")
+          (vec (for [k (range (inc j))]
+                 (if (= 1 (mod (+ i j) 4)) "cold" (nth reply-bodies k))))])))
+
+(defn- hot-thread [id comments]
+  {:id {:value id :type :string}
+   :comments {:type :nested
+              :value (vec (for [[body replies] comments]
+                            {:body {:value body :type :text}
+                             :replies {:type :nested
+                                       :value (vec (for [r replies]
+                                                     {:body {:value r :type :text}}))}}))}})
+
+(defn- hot? [s] (str/includes? s "hot"))
+
+(defn- hot-reply-q
+  "Roots with a hot reply under any comment."
+  []
+  (sc/nested-query :comments.replies (sc/text-query "comments.replies.body" "hot")))
+
+(defn- warm-hot-q
+  "Roots with a warm comment that has a hot reply."
+  []
+  (sc/nested-query :comments
+                   (sc/bool-query [[(sc/text-query "comments.body" "warm") :must]
+                                   [(hot-reply-q) :must]])
+                   {:score-mode :max}))
+
+(def ^:private hot-queries
+  "[label query-fn matches? comments]"
+  [["a top-level query on replies" hot-reply-q
+    (fn [comments] (some (fn [[_ replies]] (some hot? replies)) comments))]
+   ["a reply query inside a comment query" warm-hot-q
+    (fn [comments] (some (fn [[body replies]] (and (= "warm" body) (some hot? replies)))
+                         comments))]])
+
+(deftest candidates-page-through-multi-level-roots-in-a-store
+  (let [s (store-at (under "store"))
+        c (under "cache")
+        w (sc/open-store-index s c "main")
+        on-main (into (sorted-map) (map (juxt root-id hot-comments)) (range 12))
+        on-exp (assoc on-main
+                      (root-id 0) [["warm" ["cold"]]]
+                      (root-id 1) [["warm" ["hot"]] ["cool" ["cold"]]]
+                      (root-id 12) [["cool" ["hot"]]]
+                      (root-id 13) [["warm" ["hot hot"]]])]
+    (try
+      (doseq [[id comments] on-main]
+        (sc/add-doc w (hot-thread id comments)))
+      (sc/commit! w "roots")
+      (assert-writer-blocks-intact w)
+      (let [main-address (sc/snapshot-address w)
+            exp (sc/fork w "exp")]
+        (try
+          (doseq [id [(root-id 0) (root-id 1)]]
+            (sc/update-doc exp "id" id (hot-thread id (on-exp id))))
+          (doseq [id [(root-id 12) (root-id 13)]]
+            (sc/add-doc exp (hot-thread id (on-exp id))))
+          (assert-writer-blocks-intact exp)
+          (sc/commit! exp "exp edits")
+          (doseq [[label address data] [["main" main-address on-main]
+                                        ["exp" (sc/snapshot-address exp) on-exp]]]
+            (testing label
+              (with-open [snap (sc/open-store-snapshot s c address)]
+                (assert-blocks-intact (:reader snap))
+                (is (= (count data) (sc/count-store-snapshot snap :all)))
+                (doseq [[qlabel query-fn matches?] hot-queries
+                        :let [expected (vec (sort (keep (fn [[id cs]] (when (matches? cs) id))
+                                                        data)))
+                              pages (max 1 (quot (+ 3 (count expected)) 4))]]
+                  (testing qlabel
+                    (is (< 0 (count expected) (count data)) "precondition: a selective query")
+                    (is (= (count expected) (sc/count-store-snapshot snap (query-fn))))
+                    (testing "by score"
+                      (let [{:keys [candidates] :as paged}
+                            (page-through snap query-fn {:page-size 4 :fields [:id]
+                                                         :query-id :hot})]
+                        (is (= expected (ids candidates)) "every matching root, each once")
+                        (is (= pages (:pages paged)))
+                        (is (apply >= (map :score candidates)))))
+                    (testing "by doc id"
+                      (let [{:keys [candidates] :as paged}
+                            (page-through snap query-fn {:page-size 4 :fields [:id]
+                                                         :order :doc-id})]
+                        (is (= expected (ids candidates)))
+                        (is (= pages (:pages paged)))
+                        (is (apply < (map :doc-id candidates)))))))
+                (testing "the two sets differ: one comment holding both is not
+                          a warm comment beside a hot reply"
+                  (is (not= (sc/count-store-snapshot snap (hot-reply-q))
+                            (sc/count-store-snapshot snap (warm-hot-q)))))
+                (testing "a continuation belongs to its query, inner levels included"
+                  (let [{:keys [continuation]} (sc/candidate-page snap (warm-hot-q)
+                                                                  {:page-size 1})]
+                    (is continuation)
+                    (is (seq (:candidates (sc/candidate-page snap (warm-hot-q)
+                                                             {:page-size 1
+                                                              :after continuation}))))
+                    (doseq [other [(hot-reply-q)
+                                   (sc/nested-query
+                                    :comments
+                                    (sc/bool-query
+                                     [[(sc/text-query "comments.body" "warm") :must]
+                                      [(sc/nested-query :comments.replies
+                                                        (sc/text-query "comments.replies.body"
+                                                                       "hot")
+                                                        {:score-mode :min})
+                                       :must]])
+                                    {:score-mode :max})]]
+                      (is (thrown? ExceptionInfo
+                                   (sc/candidate-page snap other {:page-size 1
+                                                                  :after continuation})))))))))
+          (finally (sc/close! exp))))
+      (finally (sc/close! w)))))
+
+(deftest a-detached-generation-seals-multi-level-blocks
+  (let [s (store-at (under "store"))
+        c (under "cache")
+        source (sc/open-store-index s c "source")
+        count-at (fn [snap author replier]
+                   (sc/count-store-snapshot snap (comment-replied author replier)))]
+    (try
+      (seed-threads! source seed-threads)
+      (sc/commit! source "base")
+      (let [base (sc/snapshot-address source)
+            generation (sc/begin-generation s c base
+                                            {:workspace-id "multi-level-generation"})]
+        (try
+          (sc/add-doc generation (thread "t5" [["gus" "hal"]]))
+          (assert-writer-blocks-intact generation)
+          (sc/update-doc generation "id" "t1" (thread "t1" [["alice" "ivy"]]))
+          (assert-writer-blocks-intact generation)
+          (sc/delete-query generation (comment-replied "carol" "bob"))
+          (assert-writer-blocks-intact generation)
+          (let [sealed (sc/seal-generation! generation "nested")]
+            (with-open [snap (sc/open-store-snapshot s c sealed)]
+              (assert-blocks-intact (:reader snap))
+              (is (= ["t1" "t3" "t4" "t5"]
+                     (ids (sc/search-store-snapshot snap :all {:limit 100}))))
+              (is (= 1 (count-at snap "gus" "hal")))
+              (is (= 1 (count-at snap "alice" "ivy")))
+              (is (= 0 (count-at snap "alice" "bob")) "t1's old tree is gone")
+              (is (= 0 (sc/count-store-snapshot snap (replies-by "dave")))
+                  "t2 went with its comments' replies")
+              (is (= 1 (count-at snap "bob" "alice"))))
+            (with-open [snap (sc/open-store-snapshot s c base)]
+              (assert-blocks-intact (:reader snap))
+              (is (= 1 (count-at snap "alice" "bob")) "the base generation is untouched")
+              (is (= 1 (count-at snap "carol" "bob")))
+              (is (= 0 (count-at snap "gus" "hal"))))
+            (sc/release-generation! generation))
+          (finally (sc/close! generation))))
+      (finally (sc/close! source)))))

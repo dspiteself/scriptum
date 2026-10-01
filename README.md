@@ -289,6 +289,8 @@ Scriptum provides composable query builders so you don't need to import Lucene c
 
 ;; Roots with a nested child matching a query (see Nested Documents)
 (sc/nested-query :comments {:term [:comments.author "alice"]} {:score-mode :max})
+;; ...and one level down: roots with a reply by bob under any comment
+(sc/nested-query :comments.replies {:term [:comments.replies.author "bob"]})
 
 ;; Pass any query to search
 (sc/search writer (sc/text-query :body "lucene") {:limit 10})
@@ -344,8 +346,9 @@ a nested query must all hold for the same object:
                    {:score-mode :max}))
 ```
 
-- A child map takes the same field specs as a document. Its fields are named
-  `<path>.<field>` (`comments.author`), and child queries use those names.
+- A child map takes the same field specs as a document, `:nested` included
+  (see below). Its fields are named `<path>.<field>` (`comments.author`), and
+  child queries use those names.
 - `:score-mode` sets how the matching children's scores become the root's:
   `:avg` (the default, as in ES), `:max`, `:min`, `:sum` or `:none`.
 - **Only roots are results.** `search`, `:all`, `search-store-snapshot`,
@@ -360,30 +363,84 @@ a nested query must all hold for the same object:
   reader: `(.count (IndexSearcher. reader) sc/roots-query)`. `search` stops at
   its `:limit`, so `(count (sc/search writer :all))` does not count roots.
   `sc/roots-bitset` is the matching parents filter for your own block-join
-  queries; share that one instance, since it caches per segment.
+  queries; share that one instance, since it caches per segment
+  (`NestedQuery/parentFilter` gives the same for the objects on one path).
 - **Deletes and updates act on whole blocks.** Once an index holds nested
   documents, `delete-docs`, `delete-query` and `update-doc` match roots only,
-  and each matched root takes its children with it. A delete by a field that
-  only children carry matches nothing, and an `update-doc` keyed by one
-  replaces nothing and adds the new block. To change one comment you reindex
+  and each matched root takes its children with it, at every level. A delete
+  by a field that only children carry matches nothing, and an `update-doc`
+  keyed by one replaces nothing and adds the new block. To change one comment you reindex
   its post with `update-doc`, as in ES. An index that never used `:nested`
   keeps the plain term-delete path. The choice is made atomically with the
   write, so concurrent writers need no coordination while an index gets its
   first children.
 - `add-block` adds a pre-built block of Lucene documents, children first and
-  root last. Each child carries a `_nested_path` StringField
-  (`sc/nested-path-field`) holding its path, and the root does not. A block of
-  any other shape is refused before anything is written, as is a lone child
-  passed to `add-document` and a doc-map with a top-level `_nested_path` key.
+  root last, in the order below. Each child carries a `_nested_path`
+  StringField (`sc/nested-path-field`) holding its path, and the root does not.
+  A block of any other shape is refused before anything is written, as is a
+  lone child passed to `add-document` and a doc-map with a top-level
+  `_nested_path` key.
 - Existing indexes need no migration: a document without `_nested_path` is a
   root.
-- Not supported yet: nesting inside a nested object, inner hits, and sorting
-  by a nested field.
+- Not supported yet: inner hits, and sorting by a nested field.
 
 The whole-block rule exists because a root deleted without its children
 corrupts the index silently. Before a merge, nested queries still return the
 deleted root through its children. At the next merge the children join the
 following root's block, and Lucene's `CheckJoinIndex` does not detect it.
+
+#### Nested inside nested
+
+A child map may have `:nested` fields of its own, to any depth:
+
+```clojure
+(sc/add-doc writer {:id       {:value "post-2" :type :string}
+                    :comments {:type :nested
+                               :value [{:author  {:value "alice" :type :string}
+                                        :replies {:type :nested
+                                                  :value [{:author {:value "bob" :type :string}}]}}
+                                       {:author  {:value "carol" :type :string}}]}})
+
+;; Posts with a comment by alice that has a reply by bob. The inner query joins
+;; to the comment the outer one is matching, so both hold for ONE comment.
+(sc/search writer
+  (sc/nested-query :comments
+                   (sc/bool-query [[{:term [:comments.author "alice"]} :filter]
+                                   [(sc/nested-query :comments.replies
+                                                     {:term [:comments.replies.author "bob"]})
+                                    :filter]])))
+
+;; Posts with a reply by bob under any comment: at top level, a nested query on
+;; a deeper path joins straight to the roots.
+(sc/search writer (sc/nested-query :comments.replies {:term [:comments.replies.author "bob"]}))
+```
+
+- **Paths.** A path joins the `:nested` field names from the root down with
+  dots: the replies above are on `comments.replies`, and their fields are
+  `comments.replies.author`, as in ES. Each segment is one level, so a
+  `:nested` field name may not itself contain a dot, and `add-doc` refuses one.
+  Other field names may.
+- **Binding.** As in ES, a nested query inside another one's child query
+  joins to THAT query's objects, and a top-level one joins to the roots. The
+  inner path must be under the outer one, and may skip levels: a query on
+  `a.b.c` directly inside one on `a` joins each `c` to its own `a`. The inner
+  query may sit in `bool-query` clauses (`:must-not` included), `BoostQuery`,
+  `ConstantScoreQuery` or `DisjunctionMaxQuery`, which are rebuilt around it.
+  Reached through any other query it cannot be rebound, so `nested-query`
+  throws `IllegalArgumentException` rather than join it to the wrong level.
+- **Order.** A block is its root's tree in post-order: each object right after
+  its own children, nested fields in doc-map order, the root last. That is
+  what lets a block join over the objects on any one path find, for an object
+  below them, its own ancestor. A pre-built block for `add-block` must keep
+  every child's parent after it, before any other of its ancestors'
+  documents; one that does not is refused, since its children would join
+  another object, often in another root's block.
+
+`nested-query` returns an `org.replikativ.scriptum.NestedQuery`, which keeps
+its path, score mode and binding as data and becomes Lucene's
+`ToParentBlockJoinQuery` when a search rewrites it. A `ToParentBlockJoinQuery`
+built directly cannot be rebound, because it exposes neither its parents
+filter nor its score mode.
 
 ### Time Travel
 
@@ -549,6 +606,12 @@ A nested block must be deleted whole. `deleteDocuments(term)` or
 children live, and after the next merge they belong to the following parent.
 To delete a parent from Java, pass `deleteDocuments(query)` the parent query OR
 a `ToChildBlockJoinQuery` over it, which is what `delete-docs` does in Clojure.
+
+From Java, `new NestedQuery("comments", childQuery, ScoreMode.Avg)` is the
+nested query, joined to the roots; nested queries inside `childQuery` are bound
+to `comments` as it is built. `NestedQuery.rootsQuery()`,
+`NestedQuery.rootsFilter()` and `NestedQuery.parentFilter(path)` are the shared
+root query and parents filters.
 
 ## Konserve-Backed Storage
 
