@@ -2208,3 +2208,415 @@
                                                       {:page-size 10}))))
               "the same query without requests pages as before")))
       (finally (sc/close! w)))))
+
+;; =============================================================================
+;; Sorting
+;; =============================================================================
+
+(def ^:private type-fields
+  "The field each sortable :type is indexed under, on roots and children alike."
+  {:int "int" :long "long" :float "float" :double "double"})
+
+(def ^:private sort-encodings
+  "How each :type holds a test number n: past the int range for :long, with a
+  fraction for :float and :double. Each is increasing, so all order as n does."
+  {:int int
+   :long #(* 10000000000 (long %))
+   :float #(float (+ % 0.5))
+   :double #(- % 0.25)})
+
+(def ^:private extremes
+  "Each :type's [lowest highest] value: what a hit without one sorts as."
+  {:int [Integer/MIN_VALUE Integer/MAX_VALUE]
+   :long [Long/MIN_VALUE Long/MAX_VALUE]
+   :float [Float/NEGATIVE_INFINITY Float/POSITIVE_INFINITY]
+   :double [Double/NEGATIVE_INFINITY Double/POSITIVE_INFINITY]})
+
+(def ^:private value-classes
+  {:int Integer :long Long :float Float :double Double})
+
+(defn- typed-fields
+  "A field per sortable :type holding each of `ns`, encoded for the type; none
+  for no `ns`."
+  [ns]
+  (into {}
+        (map (fn [[type fname]]
+               [fname {:type type :value (mapv (sort-encodings type) ns)}]))
+        type-fields))
+
+(defn- expected-sort
+  "`order`, [id n] pairs, as the [id sort-values] of a one-spec sort by `type`:
+  n encoded for the type, or for :min or :max the type's extreme."
+  [type order]
+  (mapv (fn [[id n]]
+          [id [(case n
+                 :min (first (extremes type))
+                 :max (peek (extremes type))
+                 ((sort-encodings type) n))]])
+        order))
+
+(defn- sorted
+  "[id sort-values] of each hit of `query` (default :all) in `w`, by `sort`."
+  ([w sort] (sorted w :all sort))
+  ([w query sort]
+   (mapv (juxt #(get % "id") :sort-values)
+         (sc/search w query {:limit 100 :sort sort}))))
+
+(def ^:private single-values
+  "One value per root, or none. c's 0 is what Lucene sorts a hit without a
+  value as unless told otherwise, so d and f would land beside c."
+  [["a" -7] ["b" 3] ["c" 0] ["d" nil] ["e" -100] ["f" nil]])
+
+(def ^:private single-value-orders
+  "`single-values` in order, per sort options."
+  {{} [["e" -100] ["a" -7] ["c" 0] ["b" 3] ["d" :max] ["f" :max]]
+   {:order :desc} [["b" 3] ["c" 0] ["a" -7] ["e" -100] ["d" :min] ["f" :min]]
+   {:missing :first} [["d" :min] ["f" :min] ["e" -100] ["a" -7] ["c" 0] ["b" 3]]
+   {:order :desc :missing :first} [["d" :max] ["f" :max] ["b" 3] ["c" 0] ["a" -7] ["e" -100]]})
+
+(deftest root-fields-sort-by-every-numeric-type
+  (testing "ascending and descending, through negative values, with the hits
+            that have none :last (the default) or :first in either order, in a
+            flat index and a nested one"
+    (doseq [nested? [false true]]
+      (let [w (sc/create-index (under (str "idx-" nested?)) "main")]
+        (try
+          (doseq [batch (partition-all 2 single-values)]
+            (doseq [[id n] batch]
+              (sc/add-doc w (cond-> (assoc (typed-fields (if n [n] []))
+                                           :id {:value id :type :string})
+                              nested? (assoc :comments {:type :nested
+                                                        :value [(typed-fields [1000])]}))))
+            (sc/commit! w))
+          (with-open [r (sc/snapshot w)]
+            (is (< 1 (count (.leaves r))) "precondition: hits from several segments"))
+          (doseq [[type fname] type-fields
+                  [opts order] single-value-orders]
+            (let [results (sc/search w :all {:limit 100
+                                             :sort [(merge {:field fname :type type} opts)]})]
+              (is (= (expected-sort type order)
+                     (mapv (juxt #(get % "id") :sort-values) results))
+                  (pr-str nested? type opts))
+              (is (every? #(instance? (value-classes type) (first (:sort-values %))) results)
+                  "each value as the type reads it")))
+          (testing ":field may be a keyword, and :limit keeps the first hits"
+            (is (= [["e" [-100]] ["a" [-7]]]
+                   (mapv (juxt #(get % "id") :sort-values)
+                         (sc/search w :all {:limit 2 :sort [{:field :int :type :int}]})))))
+          (finally (sc/close! w)))))))
+
+(def ^:private sort-roots
+  "Each root's children as [author n]. n2's only child is bob's and n3 has
+  none, so under an alice filter neither has a value."
+  [["n1" [["alice" -3] ["bob" 7]]]
+   ["n2" [["bob" 2]]]
+   ["n3" []]
+   ["n4" [["alice" -8] ["alice" -1]]]
+   ["n5" [["bob" -20] ["alice" 5]]]])
+
+(defn- sort-root
+  "A root with a :comments child per [author n], each holding n in every
+  type's field. The root holds all its children's n too, multi-valued, so
+  sorting roots by their own field and by their children's must agree."
+  [[id children]]
+  (assoc (typed-fields (map second children))
+         :id {:value id :type :string}
+         :comments {:type :nested
+                    :value (mapv (fn [[author n]]
+                                   (assoc (typed-fields [n])
+                                          :author {:value author :type :string}))
+                                 children)}))
+
+(defn- seed-sort-roots!
+  "`sort-roots` in two segments, n1 and n2 in the first."
+  [w]
+  (run! #(sc/add-doc w (sort-root %)) (take 2 sort-roots))
+  (sc/commit! w)
+  (run! #(sc/add-doc w (sort-root %)) (drop 2 sort-roots))
+  (sc/commit! w))
+
+(def ^:private every-child-orders
+  "`sort-roots` in order by every child's n, per sort options."
+  {{} [["n5" -20] ["n4" -8] ["n1" -3] ["n2" 2] ["n3" :max]]
+   {:mode :max} [["n4" -1] ["n2" 2] ["n5" 5] ["n1" 7] ["n3" :max]]
+   {:order :desc} [["n1" 7] ["n5" 5] ["n2" 2] ["n4" -1] ["n3" :min]]
+   {:order :desc :mode :min} [["n2" 2] ["n1" -3] ["n4" -8] ["n5" -20] ["n3" :min]]
+   {:missing :first} [["n3" :min] ["n5" -20] ["n4" -8] ["n1" -3] ["n2" 2]]
+   {:order :desc :missing :first} [["n3" :max] ["n1" 7] ["n5" 5] ["n2" 2] ["n4" -1]]})
+
+(def ^:private alice-child-orders
+  "`sort-roots` in order by the n of alice's children only, per sort options."
+  {{} [["n4" -8] ["n1" -3] ["n5" 5] ["n2" :max] ["n3" :max]]
+   {:mode :max} [["n1" -3] ["n4" -1] ["n5" 5] ["n2" :max] ["n3" :max]]
+   {:order :desc} [["n5" 5] ["n4" -1] ["n1" -3] ["n2" :min] ["n3" :min]]
+   {:order :desc :mode :min} [["n5" 5] ["n1" -3] ["n4" -8] ["n2" :min] ["n3" :min]]
+   {:missing :first} [["n2" :min] ["n3" :min] ["n4" -8] ["n1" -3] ["n5" 5]]
+   {:order :desc :missing :first} [["n2" :max] ["n3" :max] ["n5" 5] ["n4" -1] ["n1" -3]]})
+
+(def ^:private alice-comment {:term [:comments.author "alice"]})
+
+(deftest nested-sort-reads-each-roots-children
+  (let [w (sc/create-index (under "idx") "main")
+        check (fn [orders spec-of]
+                (doseq [[type fname] type-fields
+                        [opts order] orders]
+                  (is (= (expected-sort type order) (sorted w [(merge (spec-of type fname) opts)]))
+                      (pr-str type opts))))
+        by-children (fn [filter]
+                      (fn [type fname]
+                        {:field (str "comments." fname) :type type
+                         :nested (cond-> {:path :comments} filter (assoc :filter filter))}))]
+    (try
+      (seed-sort-roots! w)
+      (assert-writer-blocks-intact w)
+      (testing "a multi-valued root field sorts by its :min or :max value"
+        (check every-child-orders (fn [type fname] {:field fname :type type})))
+      (testing "a nested sort by the same :mode of its children's values agrees"
+        (check every-child-orders (by-children nil)))
+      (testing "a :filter reads only the children it matches. A root with none,
+                n2 with bob's child or n3 with no child, sorts last in either
+                order unless :missing is :first"
+        (is (not= (map first (alice-child-orders {}))
+                  (map first (alice-child-orders {:mode :max})))
+            "precondition: :min and :max order these roots differently")
+        (check alice-child-orders (by-children alice-comment)))
+      (testing "replacing n1, ahead of n2 in their segment, leaves n2 only its own child"
+        ;; Roots without children keep the deleted share low enough that no
+        ;; merge on flush reclaims n1's old block before the search; the query
+        ;; leaves them out.
+        (dotimes [i 20]
+          (sc/add-doc w {:id {:value (format "z%02d" i) :type :string}}))
+        (sc/commit! w)
+        (sc/update-doc w "id" "n1" (sort-root ["n1" [["alice" 9]]]))
+        (sc/commit! w)
+        (with-open [r (sc/snapshot w)]
+          (is (= 3 (.numDeletedDocs (.reader ^LeafReaderContext (first (.leaves r)))))
+              "precondition: n1's old block is still in place, ahead of n2"))
+        (assert-writer-blocks-intact w)
+        (let [roots (sc/terms-query :id (map first sort-roots))
+              after (fn []
+                      (let [by-alice (sorted w roots [((by-children alice-comment) :int "int")])]
+                        (is (= (expected-sort :int [["n4" -8] ["n5" 5] ["n1" 9]])
+                               (subvec by-alice 0 3)))
+                        ;; Missing values tie, and a merge may reorder n2 and n3.
+                        (is (= (set (expected-sort :int [["n2" :max] ["n3" :max]]))
+                               (set (subvec by-alice 3)))))
+                      (is (= (expected-sort :int [["n5" -20] ["n4" -8] ["n2" 2] ["n1" 9] ["n3" :max]])
+                             (sorted w roots [((by-children nil) :int "int")]))))]
+          (after)
+          (testing "and after a merge drops the old block"
+            (.forceMerge ^BranchIndexWriter (sc/->writer w) 1)
+            (sc/commit! w)
+            (assert-writer-blocks-intact w)
+            (after))))
+      (finally (sc/close! w)))))
+
+(defn- rated-thread
+  "A root with a :comments child per [author n & replies], each reply an
+  [author n]; a comment's n is in comments.n, a reply's in comments.replies.n."
+  [id comments]
+  {:id {:value id :type :string}
+   :comments {:type :nested
+              :value (mapv (fn [[author n & replies]]
+                             {:author {:value author :type :string}
+                              :n {:value n :type :int}
+                              :replies {:type :nested
+                                        :value (mapv (fn [[by m]]
+                                                       {:author {:value by :type :string}
+                                                        :n {:value m :type :int}})
+                                                     replies)}})
+                           comments)}})
+
+(def ^:private rated-threads
+  [["d1" [["alice" 10 ["bob" 4] ["carol" -2]] ["dave" 20 ["bob" 9]]]]
+   ["d2" [["erin" 5 ["bob" 1]]]]
+   ["d3" [["frank" 1]]]
+   ["d4" []]])
+
+(deftest nested-sort-on-a-deep-path
+  (let [w (sc/create-index (under "idx") "main")
+        hi Integer/MAX_VALUE
+        lo Integer/MIN_VALUE
+        by-replies (fn [opts filter]
+                     [(merge {:field "comments.replies.n" :type :int
+                              :nested (cond-> {:path "comments.replies"}
+                                        filter (assoc :filter filter))}
+                             opts)])
+        by-comments-with-reply (fn [author opts]
+                                 [(merge {:field "comments.n" :type :int
+                                          :nested {:path :comments
+                                                   :filter (sc/nested-query
+                                                            :comments.replies
+                                                            {:term [:comments.replies.author author]})}}
+                                         opts)])]
+    (try
+      (doseq [[id comments] rated-threads]
+        (sc/add-doc w (rated-thread id comments)))
+      (sc/commit! w)
+      (testing "the sort joins to the roots, so each root sorts by every reply
+                under any of its comments"
+        (is (= [["d1" [-2]] ["d2" [1]] ["d3" [hi]] ["d4" [hi]]] (sorted w (by-replies {} nil))))
+        (is (= [["d1" [9]] ["d2" [1]] ["d3" [lo]] ["d4" [lo]]]
+               (sorted w (by-replies {:order :desc} nil))))
+        (is (= [["d2" [1]] ["d1" [9]] ["d3" [hi]] ["d4" [hi]]]
+               (sorted w (by-replies {:mode :max} nil))))
+        (is (= [["d2" [1]] ["d1" [4]] ["d3" [hi]] ["d4" [hi]]]
+               (sorted w (by-replies {} {:term [:comments.replies.author "bob"]})))))
+      (testing "a nested query in the :filter joins to the path's objects, as
+                inside a nested-query on that path"
+        (is (= [["d1" [10]] ["d2" [hi]] ["d3" [hi]] ["d4" [hi]]]
+               (sorted w (by-comments-with-reply "carol" {})))
+            "only alice's comment has a reply by carol")
+        (is (= [["d2" [5]] ["d1" [10]] ["d3" [hi]] ["d4" [hi]]]
+               (sorted w (by-comments-with-reply "bob" {}))))
+        (is (= [["d1" [20]] ["d2" [5]] ["d3" [lo]] ["d4" [lo]]]
+               (sorted w (by-comments-with-reply "bob" {:order :desc})))))
+      (finally (sc/close! w)))))
+
+(deftest sort-specs-are-checked
+  (let [w (sc/create-index (under "idx") "main")
+        refused (fn [re sort]
+                  (is (thrown-with-msg? ExceptionInfo re (sc/search w :all {:sort sort}))
+                      (pr-str sort)))
+        nested (fn [field opts] (merge {:field field :type :int :nested {:path :comments}} opts))]
+    (try
+      (seed-sort-roots! w)
+      (testing ":string and :text are refused, saying why"
+        (refused #"doc values" [{:field "id" :type :string}])
+        (refused #"doc values" [(nested "comments.author" {:type :text})]))
+      (testing ":type is required, and must be a sortable one"
+        (refused #":type is required" [{:field "int"}])
+        (refused #":type is required" [{:field "int" :type :integer}]))
+      (testing "ES's other modes are not supported"
+        (doseq [mode [:avg :sum :median]]
+          (refused #"not supported" [{:field "int" :type :int :mode mode}])
+          (refused #"not supported" [(nested "comments.int" {:mode mode})]))
+        (refused #":mode is :min or :max" [{:field "int" :type :int :mode :first}]))
+      (testing "every other malformed :sort"
+        (doseq [sort [:score
+                      {:field "int" :type :int}
+                      [:relevance]
+                      ["int"]
+                      [{:type :int}]
+                      [{:field "" :type :int}]
+                      [{:field "int" :type :int :order :up}]
+                      [{:field "int" :type :int :missing :middle}]
+                      [{:field "int" :type :int :missing 0}]
+                      [{:field "int" :type :int :unmapped-type :long}]
+                      [(nested "comments.int" {:nested "comments"})]
+                      [(nested "comments.int" {:nested {:path "comments."}})]
+                      [(nested "comments.int" {:nested {:filter alice-comment}})]
+                      [(nested "comments.int" {:nested {:path :comments :max-children 1}})]]]
+          (refused #"sort" sort)))
+      (testing "a nested query in a :filter is bound as by nested-query, with its errors"
+        (is (thrown? IllegalArgumentException
+                     (sc/search w :all {:sort [(nested "comments.int"
+                                                       {:nested {:path :comments
+                                                                 :filter (sc/nested-query
+                                                                          :reviews
+                                                                          {:term [:reviews.by "x"]})}})]}))))
+      (testing "a field indexed otherwise than :type says is refused when searched.
+                Lucene lets a nested one through, and truncates :long values read as :int"
+        (refused #"8-byte numbers" [{:field "long" :type :int}])
+        (refused #"8-byte numbers" [(nested "comments.long" {})])
+        (refused #"8-byte numbers" [(nested "comments.double" {:type :float})])
+        (refused #"4-byte numbers" [(nested "comments.int" {:type :long})])
+        (refused #"no numeric doc values" [{:field "id" :type :long}])
+        (refused #"no numeric doc values" [(nested "comments.author" {})]))
+      (testing "but a field no document has is not an error: every hit lacks it"
+        (is (= (expected-sort :int (map (fn [[id]] [id :max]) sort-roots))
+               (sorted w [{:field "nothing" :type :int}]))))
+      (finally (sc/close! w)))))
+
+(deftest sorts-combine-with-the-score
+  (let [w (sc/create-index (under "idx") "main")
+        q (sc/text-query :body "lucene")
+        stars [{:field "comments.stars" :type :int :nested {:path :comments}}]
+        ids (fn [results] (mapv #(get % "id") results))
+        search (fn [sort] (sc/search w q {:limit 100 :sort sort}))]
+    (try
+      (doseq [[id body ns] [["t1" "lucene" [2 6]]
+                            ["t2" "lucene lucene lucene" [2]]
+                            ["t3" "lucene" [1]]
+                            ["t4" "other" [0]]]]
+        (sc/add-doc w {:id {:value id :type :string}
+                       :body {:value body :type :text}
+                       :comments {:type :nested
+                                  :value (mapv (fn [n] {:stars {:value n :type :int}}) ns)}}))
+      (sc/commit! w)
+      (let [plain (sc/search w q {:limit 100})
+            score (into {} (map (juxt #(get % "id") :score)) plain)]
+        (is (= ["t2" "t1" "t3"] (ids plain)) "precondition: t2 scores best")
+        (is (> (score "t2") (score "t1")))
+        (testing "ties on the nested value go to the next spec, then to the doc id"
+          (is (= [["t3" [1 (score "t3")]] ["t2" [2 (score "t2")]] ["t1" [2 (score "t1")]]]
+                 (mapv (juxt #(get % "id") :sort-values) (search (conj stars :score)))))
+          (is (= ["t3" "t1" "t2"] (ids (search (conj stars :doc-id)))))
+          (is (= ["t3" "t1" "t2"] (ids (search stars)))))
+        (testing ":score is the query's score whatever the sort"
+          (doseq [sort [stars (conj stars :score) [:doc-id]]]
+            (is (= score (into {} (map (juxt #(get % "id") :score)) (search sort)))
+                (pr-str sort))))
+        (testing ":score alone is the usual order, and :doc-id index order"
+          (is (= (mapv #(assoc % :sort-values [(:score %)]) plain) (search [:score])))
+          (is (= ["t1" "t2" "t3"] (ids (search [:doc-id]))))
+          (is (every? #(= [(:doc-id %)] (:sort-values %)) (search [:doc-id]))))
+        (testing "no :sort, or an empty one, is the search as it was"
+          (is (not-any? #(contains? % :sort-values) plain))
+          (is (= plain (search nil) (search [])))))
+      (finally (sc/close! w)))))
+
+(deftest sorted-hits-keep-their-inner-hits
+  (let [w (sc/create-index (under "idx") "main")
+        q (sc/nested-query :comments alice-comment {:inner-hits {:size 10}})
+        sort [{:field "comments.int" :type :int :order :desc
+               :nested {:path :comments :filter alice-comment}}]]
+    (try
+      (seed-sort-roots! w)
+      (let [plain (by-id (sc/search w q {:limit 100}))
+            results (sc/search w q {:limit 100 :sort sort})]
+        (assert-hit-shapes results)
+        (is (= [["n5" [5]] ["n4" [-1]] ["n1" [-3]]]
+               (mapv (juxt #(get % "id") :sort-values) results)))
+        (is (= plain (by-id (map #(dissoc % :sort-values) results)))
+            "the same hits, inner hits and all, in the sort's order")
+        (is (= {:total 2 :hits [["alice" [0]] ["alice" [1]]]}
+               (inner ((by-id results) "n4") "comments" "comments.author"))))
+      (finally (sc/close! w)))))
+
+(deftest sorting-a-store-snapshot
+  (let [s (store-at (under "store"))
+        c (under "cache")
+        w (sc/open-store-index s c "main")
+        by-alice [{:field "comments.double" :type :double
+                   :nested {:path :comments :filter alice-comment}}]
+        sorts [by-alice
+               [{:field "float" :type :float :order :desc :mode :min} :doc-id]
+               [{:field "comments.long" :type :long :mode :max :missing :first
+                 :nested {:path "comments"}}
+                :score]]]
+    (try
+      (seed-sort-roots! w)
+      (with-open [snap (sc/open-store-snapshot s c (sc/snapshot-address w))]
+        (testing "search-store-snapshot sorts as search does"
+          (doseq [sort sorts]
+            (is (= (sc/search w :all {:limit 100 :sort sort})
+                   (sc/search-store-snapshot snap :all {:limit 100 :sort sort}))
+                (pr-str sort)))
+          (is (= (expected-sort :double (alice-child-orders {}))
+                 (mapv (juxt #(get % "id") :sort-values)
+                       (sc/search-store-snapshot snap :all {:limit 100 :sort by-alice})))))
+        (testing "with inner hits"
+          (let [q (sc/nested-query :comments alice-comment {:inner-hits true})
+                results (sc/search-store-snapshot snap q {:limit 100 :sort by-alice})]
+            (is (= (sc/search w q {:limit 100 :sort by-alice}) results))
+            (is (= ["n4" "n1" "n5"] (mapv #(get % "id") results)))
+            (is (every? #(get-in % [:inner-hits "comments" :hits]) results))))
+        (testing "and checks the specs, and the fields against the snapshot"
+          (is (thrown-with-msg? ExceptionInfo #"not supported"
+                                (sc/search-store-snapshot snap :all {:sort [{:field "int" :type :int
+                                                                             :mode :avg}]})))
+          (is (thrown-with-msg? ExceptionInfo #"8-byte numbers"
+                                (sc/search-store-snapshot snap :all {:sort [{:field "long"
+                                                                             :type :int}]})))))
+      (finally (sc/close! w)))))

@@ -22,15 +22,16 @@
            [org.apache.lucene.document Document Field$Store TextField StringField
             IntField LongField FloatField DoubleField StoredField
             KnnFloatVectorField]
-           [org.apache.lucene.index DirectoryReader IndexReader IndexableField
-            LeafReaderContext PostingsEnum ReaderUtil StoredFields Term
+           [org.apache.lucene.index DirectoryReader DocValuesType FieldInfo IndexReader
+            IndexableField LeafReaderContext PostingsEnum ReaderUtil StoredFields Term
             VectorSimilarityFunction]
            [org.apache.lucene.search IndexSearcher Query TermQuery TermInSetQuery PrefixQuery ConstantScoreQuery BooleanQuery
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
-            FieldDoc Sort MatchAllDocsQuery KnnFloatVectorQuery
+            FieldDoc Sort SortField SortField$Type SortedNumericSelector$Type
+            SortedNumericSortField MatchAllDocsQuery KnnFloatVectorQuery
             TopScoreDocCollectorManager]
            [org.apache.lucene.search.join BitSetProducer ParentChildrenBlockJoinQuery
-            QueryBitSetProducer ScoreMode ToChildBlockJoinQuery]
+            QueryBitSetProducer ScoreMode ToChildBlockJoinQuery ToParentBlockJoinSortField]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
            [org.apache.lucene.store Directory FSDirectory]
            [org.apache.lucene.util BitSet BytesRef]
@@ -1575,6 +1576,182 @@
        (inner-hits-requests q)
        q))))
 
+;; --- Sorting ---
+;;
+;; ES's `sort`, for `search` and `search-store-snapshot`. A field sort reads
+;; doc values, and in scriptum only numeric fields have them: IntField,
+;; LongField, FloatField and DoubleField index SortedNumeric doc values, and
+;; StringField and TextField index none. So a spec names its numeric :type,
+;; which also picks the comparator that decodes those values, and :string and
+;; :text are refused.
+;;
+;; A :nested spec sorts each root by the values of its children on one path,
+;; through ToParentBlockJoinSortField. As in ES, the sort joins to the ROOTS
+;; whatever the path's depth, so a root's replies two levels down are its
+;; children here too: the roots' parents filter takes every document between
+;; one root and the next, and the path filter picks the replies among them.
+
+(def ^:private sort-types
+  "Each sortable :type, as Lucene's SortField type and the bytes per point of
+  the field scriptum indexes for it."
+  {:int [SortField$Type/INT 4]
+   :long [SortField$Type/LONG 8]
+   :float [SortField$Type/FLOAT 4]
+   :double [SortField$Type/DOUBLE 8]})
+
+(defn- missing-value
+  "The value a hit without one sorts as: the lowest or highest of `type`, as
+  :first or :last and the order require.
+
+  EXPLICIT, because Lucene's numeric default is 0: left unset, a hit without
+  the field sorts among the zeros, between the negative values and the
+  positive ones. The extremes are ES's, -Infinity and Infinity for :float and
+  :double, so a hit that HAS the extreme ties with the missing ones, and the
+  next spec, then the doc id, decides."
+  [type missing reverse?]
+  (let [low? (not= (= :first missing) (boolean reverse?))]
+    (case type
+      :int (Integer/valueOf (if low? Integer/MIN_VALUE Integer/MAX_VALUE))
+      :long (Long/valueOf (if low? Long/MIN_VALUE Long/MAX_VALUE))
+      :float (Float/valueOf (if low? Float/NEGATIVE_INFINITY Float/POSITIVE_INFINITY))
+      :double (Double/valueOf (if low? Double/NEGATIVE_INFINITY Double/POSITIVE_INFINITY)))))
+
+(defn- nested-sort-children
+  "The children a sort's `:nested` spec reads, the documents on its :path that
+  match its :filter, as the child filter ToParentBlockJoinSortField takes.
+
+  Without a :filter it is the path's SHARED `NestedQuery/parentFilter`, whose
+  bitsets are computed once per segment. With one it is a FRESH producer per
+  search. Its cache is keyed by segment core and lives as long as the producer,
+  which is this search, so nothing accumulates however many distinct filters
+  callers send; the cost is the filter's bitset per segment per search, about
+  what running the filter costs. Sharing a producer per filter would need a
+  cache keyed by callers' queries, which grows without bound.
+
+  The filter is a child-level query, as in `nested-query`: over the children's
+  full field names, with nested queries inside it joined to the path's
+  objects, by the same binding and with the same errors."
+  ^BitSetProducer [nested]
+  (when-not (map? nested)
+    (throw (ex-info "scriptum: a sort's :nested is a map of :path and :filter"
+                    {:nested nested})))
+  (when-let [unknown (seq (remove #{:path :filter} (keys nested)))]
+    (throw (ex-info "scriptum: a sort's :nested takes only :path and :filter"
+                    {:nested nested :unknown (vec unknown)})))
+  (let [{:keys [path filter]} nested
+        path (when (or (string? path) (keyword? path)) (name path))]
+    (when-not (NestedQuery/isValidPath path)
+      (throw (ex-info "scriptum: a sort's :nested :path is non-empty field names joined by \".\""
+                      {:nested nested})))
+    (if (nil? filter)
+      (NestedQuery/parentFilter path)
+      (QueryBitSetProducer.
+       (.childLevelQuery (NestedQuery. ^String path (clause->query filter) ScoreMode/None))))))
+
+(defn- field-sort
+  "One `{:field ...}` sort spec as {:sort-field :field :type}; see `search`.
+
+  Every option is checked here, before a reader is opened. An unknown key is
+  refused rather than ignored, as in an :inner-hits request, since a
+  misspelled :order or :missing would otherwise sort by its default."
+  [spec]
+  (when-let [unknown (seq (remove #{:field :type :order :mode :missing :nested} (keys spec)))]
+    (throw (ex-info "scriptum: a sort spec takes only :field, :type, :order, :mode, :missing and :nested"
+                    {:spec spec :unknown (vec unknown)})))
+  (let [{:keys [field type nested]} spec
+        order (or (:order spec) :asc)
+        missing (or (:missing spec) :last)
+        mode (or (:mode spec) (if (= :desc order) :max :min))
+        field (when (or (string? field) (keyword? field)) (name field))
+        reverse? (= :desc order)]
+    (when-not (seq field)
+      (throw (ex-info "scriptum: a sort spec's :field is a non-empty string or keyword"
+                      {:spec spec})))
+    (when-not (contains? sort-types type)
+      (throw (ex-info (if (#{:string :text} type)
+                        (str "scriptum: cannot sort by a " type " field: sorting reads doc values,"
+                             " and scriptum indexes them only for :int, :long, :float and :double"
+                             " fields")
+                        (str "scriptum: a sort spec's :type is required, one of :int, :long, :float"
+                             " or :double: the type the field is indexed as, whose doc values the"
+                             " sort reads"))
+                      {:spec spec :type type})))
+    (when-not (#{:asc :desc} order)
+      (throw (ex-info "scriptum: a sort spec's :order is :asc or :desc" {:spec spec})))
+    (when-not (#{:min :max} mode)
+      (throw (ex-info (if (#{:avg :sum :median} mode)
+                        (str "scriptum: sort :mode " mode " is not supported; use :min or :max")
+                        "scriptum: a sort spec's :mode is :min or :max")
+                      {:spec spec :mode mode})))
+    (when-not (#{:first :last} missing)
+      (throw (ex-info "scriptum: a sort spec's :missing is :first or :last" {:spec spec})))
+    (let [^SortField$Type lucene-type (first (sort-types type))
+          sf (if (nil? nested)
+               (SortedNumericSortField. ^String field lucene-type (boolean reverse?)
+                                        (if (= :max mode)
+                                          SortedNumericSelector$Type/MAX
+                                          SortedNumericSelector$Type/MIN))
+               ;; The fourth argument, `order`, is NOT a sort direction: in
+               ;; Lucene 10.3 the comparators read the children through
+               ;; BlockJoinSelector MAX when it is true and MIN when false.
+               (ToParentBlockJoinSortField. ^String field lucene-type (boolean reverse?)
+                                            (= :max mode) (NestedQuery/rootsFilter)
+                                            (nested-sort-children nested)))]
+      (.setMissingValue ^SortField sf (missing-value type missing reverse?))
+      {:sort-field sf :field field :type type})))
+
+(defn- sort-plan
+  "The `:sort` option of a search as {:sort Sort :fields [{:field :type}]},
+  or nil for no sort, which leaves the search exactly as it was.
+
+  Built before a reader is opened, so a malformed spec opens nothing."
+  [specs]
+  (cond
+    (nil? specs) nil
+    (not (sequential? specs))
+    (throw (ex-info "scriptum: :sort is a vector of sort specs" {:sort specs}))
+    (empty? specs) nil
+    :else
+    (let [parts (mapv (fn [spec]
+                        (cond
+                          (= :score spec) {:sort-field SortField/FIELD_SCORE}
+                          (= :doc-id spec) {:sort-field SortField/FIELD_DOC}
+                          (map? spec) (field-sort spec)
+                          :else (throw (ex-info (str "scriptum: a sort spec is :score, :doc-id"
+                                                     " or a {:field ... :type ...} map")
+                                                {:spec spec}))))
+                      specs)]
+      {:sort (Sort. ^"[Lorg.apache.lucene.search.SortField;"
+              (into-array SortField (map :sort-field parts)))
+       :fields (filterv :field parts)})))
+
+(defn- check-sort-fields!
+  "Throw unless every field `plan` sorts by is indexed in `reader` as its spec's
+  :type says, in each segment that has it.
+
+  Lucene refuses some mismatches itself, in terms of its own classes, and lets
+  others through: a :nested sort reads the children's values without checking
+  their width, so an :int sort of a :long field truncates them without a
+  word. Points show the width, so :int cannot be told from :float, nor :long
+  from :double. A field no segment holds is not an error: every hit lacks it."
+  [^IndexReader reader plan]
+  (doseq [{:keys [^String field type]} (:fields plan)
+          ^LeafReaderContext ctx (.leaves reader)
+          :let [^FieldInfo info (.fieldInfo (.getFieldInfos (.reader ctx)) field)]
+          :when info]
+    (let [doc-values (.getDocValuesType info)
+          width (second (sort-types type))]
+      (when-not (or (= DocValuesType/SORTED_NUMERIC doc-values)
+                    (= DocValuesType/NUMERIC doc-values))
+        (throw (ex-info (str "scriptum: cannot sort by \"" field "\": it has no numeric doc values,"
+                             " which only :int, :long, :float and :double fields have")
+                        {:field field :type type :doc-values (str doc-values)})))
+      (when (and (pos? (.getPointDimensionCount info))
+                 (not= width (.getPointNumBytes info)))
+        (throw (ex-info (str "scriptum: \"" field "\" holds " (.getPointNumBytes info)
+                             "-byte numbers, so it cannot be sorted as " type)
+                        {:field field :type type :bytes (.getPointNumBytes info)}))))))
+
 ;; --- Search ---
 
 (defn- nested-reader?
@@ -1649,6 +1826,22 @@
                    :doc-id (.-doc sd)
                    :score (.-score sd)))
           hits)))
+
+(defn- top-results
+  "The best `limit` hits of `q` as result maps: by score, or by the sort of
+  `plan` (`sort-plan`), each then with its :sort-values.
+
+  Without a sort, exactly the search `search` has always run. With one, scores
+  are still computed for the hits, so :score keeps its meaning whatever the
+  sort; a field sort alone would leave it NaN."
+  [^IndexSearcher searcher ^Query q limit plan fields]
+  (if-let [^Sort sort (:sort plan)]
+    (let [hits (.-scoreDocs (.search searcher q (int limit) sort true))]
+      (mapv (fn [result ^FieldDoc hit]
+              (assoc result :sort-values (vec (.-fields hit))))
+            (hits->results searcher hits fields)
+            hits))
+    (hits->results searcher (.-scoreDocs (.search searcher q (int limit))) fields)))
 
 (defn- sibling-offset
   "The position of `doc`, a document on `path` in `ctx`'s segment (leaf-relative
@@ -1780,9 +1973,50 @@
   request under a :must-not clause is not answered, as in ES. Without
   requests the results are exactly what they would be otherwise.
 
+  SORT. Results come best score first, then in index order, unless :sort
+  names an order: a vector of specs, each breaking the ties of the one before
+  it, with the doc id breaking the last ones, as ES's `sort`.
+
+    :score   - by score, best first
+    :doc-id  - by doc id, i.e. index order
+    {:field   \"price\"   ; string or keyword
+     :type    :long      ; REQUIRED: :int, :long, :float or :double, as indexed
+     :order   :asc       ; or :desc. Default :asc
+     :mode    :min       ; which of several values counts: :min or :max.
+                         ; Default :min for :asc and :max for :desc, as in ES
+     :missing :last      ; where hits without a value go, in either order:
+                         ; :first or :last. Default :last, as in ES
+     :nested  {:path \"comments\" :filter child-query}}
+
+  ONLY NUMERIC FIELDS SORT. A sort reads doc values, and scriptum indexes
+  them for :int, :long, :float and :double fields only, so :type :string or
+  :text is refused. So is a field indexed at another width than :type
+  names, when the search finds it; :int cannot be told from :float, nor :long
+  from :double, so name the right one. :mode chooses among a multi-valued
+  field's values, and under :nested among the values of every child it
+  reads; ES's :avg, :sum and :median are not supported.
+
+  NESTED SORT. With :nested, each root sorts by :field on its children on
+  :path that match :filter (default every child on the path), as in ES. A
+  root with no such child has no value and goes where :missing says. The
+  sort joins to the roots at any depth, so a :path of \"comments.replies\"
+  sorts each root by all of its replies. :filter is a child-level query as in
+  `nested-query`: over the children's full field names, with nested queries
+  in it joined to the path's objects. Without :nested a spec reads the root's
+  own field, so one only children carry leaves every root without a value.
+
+  A sorted result also has :sort-values, its value for each spec in order:
+  the score as a Float, the doc id as an Integer, and a field's value as the
+  Integer, Long, Float or Double its :type reads. A hit without a value shows
+  the value it sorted as, as ES does: the type's minimum or maximum, and
+  -Infinity or Infinity for :float and :double. :score is still the query's
+  score. Without :sort, or with an empty one, the results are exactly what
+  they would be otherwise, with no :sort-values.
+
   Options:
     :limit - max results (default 10)
     :fields - fields to retrieve (default: all stored fields)
+    :sort - how to order results (default: by score); see above
     :reader - search THIS reader instead of opening one (see below)
 
   BY DEFAULT THIS OPENS A FRESH NRT READER, so it reflects the writer's state
@@ -1813,19 +2047,19 @@
   was 1.05-3.5x on a mixed query load, which is a poor price for those."
   ([sw query]
    (search sw query {}))
-  ([sw query {:keys [limit fields reader] :or {limit 10}}]
+  ([sw query {:keys [limit fields reader] sort-specs :sort :or {limit 10}}]
    (let [^BranchIndexWriter writer (->writer sw)
          ;; From the caller's query, before ->query wraps it, and before a
          ;; reader is opened for a request that is refused.
          requests (inner-hits-requests query)
+         plan (sort-plan sort-specs)
          own-reader? (nil? reader)
          ^DirectoryReader reader (or reader (.openReader writer))]
      (try
+       (check-sort-fields! reader plan)
        (let [searcher (IndexSearcher. reader)
-             q (->query reader query)
-             top-docs (.search searcher q (int limit))
-             hits (.-scoreDocs top-docs)]
-         (with-inner-hits searcher requests (hits->results searcher hits fields)))
+             q (->query reader query)]
+         (with-inner-hits searcher requests (top-results searcher q limit plan fields)))
        ;; Close only what we opened. A caller-supplied reader outlives this
        ;; call by design — that is the whole point of passing one.
        (finally
@@ -1873,18 +2107,20 @@
   "Search an immutable `StoreSnapshot`, returning the same result vector as
   `search` without requiring a live branch or writer.
 
-  Options are `:limit` (default 10) and `:fields`. Nested queries' inner hits
-  come back as from `search`. For complete, resumable candidate enumeration
-  use `candidate-page` instead."
+  Options are `:limit` (default 10), `:fields` and `:sort`, which orders the
+  results as in `search`, nested sorts included, and gives each its
+  :sort-values. Nested queries' inner hits come back as from `search`. For
+  complete, resumable candidate enumeration use `candidate-page` instead."
   ([snapshot query]
    (search-store-snapshot snapshot query {}))
-  ([^StoreSnapshot snapshot query {:keys [limit fields] :or {limit 10}}]
+  ([^StoreSnapshot snapshot query {:keys [limit fields] sort-specs :sort :or {limit 10}}]
    (let [requests (inner-hits-requests query)
+         plan (sort-plan sort-specs)
          ^DirectoryReader reader (:reader snapshot)
-         searcher (IndexSearcher. reader)
-         top-docs (.search searcher (->query reader query) (int limit))]
+         searcher (IndexSearcher. reader)]
+     (check-sort-fields! reader plan)
      (with-inner-hits searcher requests
-       (hits->results searcher (.-scoreDocs top-docs) fields)))))
+       (top-results searcher (->query reader query) limit plan fields)))))
 
 (defn count-store-snapshot
   "Return the exact number of documents matching `query` in an immutable

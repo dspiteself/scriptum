@@ -185,8 +185,8 @@ Scriptum's field types are designed for real-world use cases like email indexing
 
 Field types:
 - `:text` - Analyzed, searchable full-text (default)
-- `:string` - Exact match, non-analyzed
-- `:int`, `:long`, `:float`, `:double` - Numeric fields with range queries and sorting
+- `:string` - Exact match, non-analyzed (not sortable: no doc values)
+- `:int`, `:long`, `:float`, `:double` - Numeric fields with range queries and [sorting](#sorting)
 - `:stored-only` - Store but don't index (for retrieval-only fields)
 - `:vector` - KNN float vector search with configurable similarity
 - `:nested` - Vector of child maps, each indexed as its own document; see [Nested Documents](#nested-documents)
@@ -320,6 +320,44 @@ Scriptum provides composable query builders so you don't need to import Lucene c
 ;; Returns: [{:field1 "val" :field2 "val" :score 1.0 :doc-id 0} ...]
 ```
 
+#### Sorting
+
+Results come best score first. `:sort` orders them instead, as ES's `sort`
+does: a vector of specs, each breaking the ties of the one before, with the doc
+id breaking the last ones.
+
+```clojure
+;; Newest first; equal dates by score
+(sc/search writer (sc/text-query :body "lucene")
+           {:sort [{:field :date :type :long :order :desc} :score]})
+;; => [{... :doc-id 7 :score 0.42 :sort-values [1717171717000 0.42]} ...]
+```
+
+- A spec is `:score` (best first), `:doc-id` (index order), or a map of
+  `:field`, `:type`, `:order` (`:asc`, the default, or `:desc`), `:mode`,
+  `:missing` and `:nested` (see [Sorting by nested
+  fields](#sorting-by-nested-fields)).
+- **Only numeric fields sort.** A field sort reads doc values, which scriptum
+  indexes for `:int`, `:long`, `:float` and `:double` fields only, so `:type`
+  is required and names one of those, as the field was indexed. `:string` and
+  `:text` are refused: they have no doc values, so strings cannot be sorted
+  yet. A field indexed at another width than `:type` names (an `:int` sort of
+  a `:long` field) is refused when searched. `:int` and `:float` cannot be told
+  apart, and neither can `:long` and `:double`.
+- `:mode` picks which of a multi-valued field's values counts: `:min` (the
+  default for `:asc`) or `:max` (the default for `:desc`), as in ES. ES's
+  `avg`, `sum` and `median` are not supported.
+- `:missing` puts hits without a value `:last` (the default) or `:first`, in
+  either order.
+- Each result also has `:sort-values`, its value for each spec: the score as a
+  Float, the doc id as an Integer, a field's value as the Integer, Long, Float
+  or Double its `:type` reads. A hit without a value shows what it sorted as,
+  as ES does: the type's minimum or maximum, or -Infinity or Infinity. `:score`
+  is still the query's score.
+- Without `:sort` the search is exactly what it was, with no `:sort-values`.
+  `search-store-snapshot` takes `:sort` too; `candidate-page` keeps its own
+  `:order`.
+
 ### Nested Documents
 
 Elasticsearch-style `nested` objects, stored as Lucene block joins. Each object
@@ -381,7 +419,8 @@ a nested query must all hold for the same object:
   `_nested_path` key.
 - Existing indexes need no migration: a document without `_nested_path` is a
   root.
-- Not supported yet: sorting by a nested field.
+- Roots sort by their children's fields with `:nested` in a sort spec; see
+  [Sorting by nested fields](#sorting-by-nested-fields).
 
 The whole-block rule exists because a root deleted without its children
 corrupts the index silently. Before a merge, nested queries still return the
@@ -500,6 +539,34 @@ ES's `inner_hits`: which children of each hit matched. Request them with
   unchanged, so `count-store-snapshot` and deletes ignore the request.
   `candidate-page` refuses it: candidates carry no children, so the request
   could only be dropped.
+
+#### Sorting by nested fields
+
+ES's nested sort. With `:nested` in a [sort spec](#sorting), each root sorts by
+the field's values on its children:
+
+```clojure
+;; Posts by their best rating from alice; posts without one last
+(sc/search writer :all
+  {:sort [{:field  "comments.stars" :type :int :order :desc
+           :nested {:path :comments
+                    :filter {:term [:comments.author "alice"]}}}]})
+```
+
+- `:path` names the children and `:filter` (optional, a child-level query as in
+  `nested-query`) narrows them. `:mode` takes the `:min` or `:max` of all their
+  values, by default `:min` for `:asc` and `:max` for `:desc`.
+- A root with no such child, whether it has no children or none that match, has
+  no value and goes where `:missing` says: last by default, in either order.
+- The sort joins to the roots at any depth, as in ES: a `:path` of
+  `comments.replies` sorts each post by all of its replies, under every
+  comment. A nested query inside `:filter` joins to the path's objects, as
+  inside `nested-query`.
+- Without `:nested` a sort reads the roots' own field. A field that only
+  children carry has no value on any root, so every root would sort as missing.
+- A sort without `:filter` shares one cached bitset of the path's children per
+  segment. A sort with a `:filter` computes the filter's bitset per segment on
+  each search, and keeps nothing once the search returns.
 
 ### Time Travel
 
@@ -670,7 +737,11 @@ From Java, `new NestedQuery("comments", childQuery, ScoreMode.Avg)` is the
 nested query, joined to the roots; nested queries inside `childQuery` are bound
 to `comments` as it is built. `NestedQuery.rootsQuery()`,
 `NestedQuery.rootsFilter()` and `NestedQuery.parentFilter(path)` are the shared
-root query and parents filters.
+root query and parents filters. To sort roots by a nested field, give Lucene's
+`ToParentBlockJoinSortField` `rootsFilter()` as its parents filter and
+`parentFilter(path)` as its child filter. Its fourth argument, `order`, is
+not a direction: `true` takes the children's maximum and `false` their
+minimum. Set a missing value too, or roots without children sort as 0.
 
 ## Konserve-Backed Storage
 
