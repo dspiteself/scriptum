@@ -58,30 +58,43 @@
     each, and blobs whose keys are content hashes, so a segment both happen to
     write is the same key holding the same bytes. Nothing needs coordinating
     because nothing is shared.
-  - The SAME branch is NOT protected. `write.lock` lives in the local cache,
-    which is per-machine, so two processes both open a writer, both commit, and
-    the manifest write is last-writer-wins: the loser's segments are silently
-    orphaned. The manifest is written unconditionally, which is the same shape
-    as datahike's branch head (datahike#878) and carries the same verdict.
+  - The SAME branch is FENCED, on a store that can make a write conditional.
+    `write.lock` lives in the local cache, which is per-machine, so two
+    processes can both open a writer and both commit. What stops the second
+    commit from silently replacing the first is the pointer write itself: a
+    writer reads the manifest's revision with the pointer when it opens, and
+    every flip writes the pointer only if that revision is still current
+    (konserve's `:expected-revision`). The writer that loses gets
+    `:scriptum/branch-moved` from its commit (see `branch-moved?`), publishes
+    nothing, and stays fenced until it is reopened from the branch's head. The
+    winner's history is untouched. A branch DELETED under a live writer is not
+    a move: that writer's next commit recreates it, as it always has — but
+    create-only, so if someone else recreated it first, this writer is fenced.
 
-    RESERVED CONCURRENCY 1 IS NOT A FIX. It narrows the window; it does not
-    close it, because a deploy or container replacement still runs two
-    environments at once. Nor does a single serialized stream suffice on its
-    own: Lambda FREEZES an environment rather than terminating it, so a thawed
-    one holds a manifest atom, a Lucene writer and a `/tmp` cache from before
-    another environment advanced the branch. Open and close a writer per
-    invocation rather than caching one, or that stale writer derives its next
-    manifest from a superseded one. (The view cache is safe either way — a
-    stale entry is repaired by inode on first touch; see `link-into-view!`.)
+    How far the fence reaches is the STORE's answer, not scriptum's —
+    `konserve.core/conditional-write-domain`: `:process` for a memory store,
+    `:machine` for a filestore, `:global` for an object store whose backend
+    evaluates the precondition itself (konserve-gcs's generation match). On a
+    store with no conditional writes the pointer is written unconditionally,
+    as before, and the old rule stands: one writer per branch, in one JVM.
 
-    The fix is a compare-and-set on the manifest. `konserve-s3` already
-    implements `put-object-conditional`, so on S3 the primitive exists and is
-    opt-in via `:config {:optimistic-locking-retries n}` — but taking it needs
-    `sync` restructured to RETRY from a re-read manifest rather than write one
-    it computed from a cached value, and the GC guard is in-process regardless,
-    so a collection on one machine still cannot see another's in-flight blobs.
-    Until both land, treat multi-writer as unsupported: one writer per branch,
-    in one JVM.
+    FENCED, NOT RETRIED. A writer that lost the race derived its commit from a
+    state that is no longer the branch's, so retrying from a re-read manifest
+    would publish a merge nobody asked for. Refusing is recoverable; a silent
+    overwrite is not. The same holds for an ambiguous failure of the pointer
+    write — a timeout after the store applied it leaves this writer holding a
+    revision the store has moved past, so its next flip is refused too. That
+    fails closed: reopen and continue.
+
+    STILL IN-PROCESS: the GC guard. A collection on one machine cannot see
+    another machine's in-flight blobs, so collect from the writer's own process
+    (or with every writer stopped). Deploys that briefly run two environments,
+    and Lambda environments thawed with a writer from before another one
+    advanced the branch, are exactly what the fence turns from silent loss into
+    a refused commit — but they still cost that commit, so open and close a
+    writer per invocation rather than caching one. (The view cache is safe
+    either way — a stale entry is repaired by inode on first touch; see
+    `link-into-view!`.)
 
   THE LUCENE CONTRACT is checked against Lucene's own conformance suite rather
   than asserted here — `BaseDirectoryTestCase`, via `scriptum.tck-runner`. It
@@ -206,6 +219,15 @@
   [store address]
   (vec (:parents (read-snapshot store address))))
 
+(defn- checked-pointer
+  "`v`, read from `branch`'s manifest, refused if it is a v1 file map."
+  [branch v]
+  (when (map? v)
+    (throw (ex-info (str "scriptum: branch " branch " still holds a v1 file map — "
+                         "the store was stamped without migrating this branch")
+                    {:branch branch :layout 1})))
+  v)
+
 (defn branch-snapshot
   "The snapshot address `branch` points at, or nil for a branch with no commit.
 
@@ -220,12 +242,49 @@
   used as a snapshot address resolves to nothing. Every read of a branch goes
   through here, so catching it once catches it everywhere."
   [store branch]
-  (let [v (k/get store (manifest-key branch) nil {:sync? true})]
-    (when (map? v)
-      (throw (ex-info (str "scriptum: branch " branch " still holds a v1 file map — "
-                           "the store was stamped without migrating this branch")
-                      {:branch branch :layout 1})))
-    v))
+  (checked-pointer branch (k/get store (manifest-key branch) nil {:sync? true})))
+
+(defn branch-head
+  "`[address revision]`: what `branch` points at, and the revision of the
+  manifest holding it, READ IN ONE CALL. The revision is what a writer fences
+  its flips on — see the namespace docstring.
+
+  One call rather than `branch-snapshot` then `konserve.core/revision`, because
+  two reads can straddle another writer's commit: the pointer from before it,
+  the revision from after, and the writer would then overwrite that commit with
+  a revision that says it may. `:with-revision?` is konserve's answer to exactly
+  that.
+
+  The revision is `konserve.core/absent` for a branch with no manifest yet, and
+  nil for a manifest written before konserve stamped revisions (a store last
+  written under 0.9.375). On a store that cannot make a write conditional at
+  all this is `[address nil]` — check `konserve.core/conditional-write?` to tell
+  that apart from the legacy case."
+  [store branch]
+  (if (k/conditional-write? store)
+    (let [[v revision] (k/get store (manifest-key branch) nil
+                              {:sync? true :with-revision? true})]
+      [(checked-pointer branch v) revision])
+    [(branch-snapshot store branch) nil]))
+
+(defn branch-moved?
+  "Does `t`, or anything in its cause chain, say a commit was refused because
+  another writer moved the branch? Walks the chain because Lucene's commit path
+  may wrap what `syncMetaData` throws."
+  [^Throwable t]
+  (boolean (some #(= :scriptum/branch-moved (:type (ex-data %)))
+                 (take-while some? (iterate #(.getCause ^Throwable %) t)))))
+
+(defn- branch-moved
+  "What a fenced writer's commit throws. `cause` is konserve's revision
+  mismatch, kept for its expected and actual revisions."
+  [branch cause]
+  (ex-info (str "scriptum: branch " branch " was moved since this writer opened it — "
+                "by another writer, or by point-branch-at! — so its commit was not "
+                "published. This writer publishes nothing more; reopen the branch to "
+                "continue from its current head.")
+           {:type :scriptum/branch-moved :branch branch}
+           cause))
 
 (def format-key
   "Where the store records which manifest layout it is in."
@@ -626,10 +685,11 @@
   permanently, for every branch. The only documented repair discarded the
   branch's data.
 
-  In-process, like the guard itself, and that is the same support boundary
-  scriptum already documents — one writer per branch, in one JVM. Two processes
+  In-process, like the guard itself, and that is the support boundary for
+  COLLECTION: collect from the process that moves the branches. Two processes
   moving branches while a third collects is not covered here any more than it is
-  by the guard."}
+  by the guard. (Two WRITERS on one branch are a different question, answered by
+  the manifest fence — see the namespace docstring.)"}
   store-locks
   (atom {}))
 
@@ -719,7 +779,14 @@
     lost, though a continuously-written replica can hold a collection off.
 
   So the id may be coarser than the physical store, never finer. Omitting it
-  disables the guard, which is only safe on a store that is never collected."
+  disables the guard, which is only safe on a store that is never collected.
+
+  FENCED on a store that can make a write conditional. The revision read with
+  the branch at open is what every flip's pointer write is conditional on, so
+  if anything else has moved the branch since — another process's writer,
+  `point-branch-at!` — this Directory's next commit is refused with
+  `:scriptum/branch-moved` rather than overwriting it. See the namespace
+  docstring."
   ;; RESOLVES THE GUARD ID rather than defaulting it to nil. Passing an explicit
   ;; nil to the 4-arity still opts out, which is only safe on a store that is
   ;; never collected — see `store-id-for` for what defaulting to nil cost.
@@ -764,10 +831,13 @@
    ;; whose snapshot is gone, and doing that after `MMapDirectory/open` leaked the
    ;; directory — nothing closes it on the way out, and its mapped arena outlives
    ;; the failed call.
-   (let [initial (let [a (if publish-ref?
-                           (branch-snapshot store branch)
-                           base-address)]
-                   {:pointer a :files (if a (snapshot-files store a) {})})
+   (let [;; Only a Directory that publishes to the branch has anything to fence,
+         ;; and only a store that can compare-and-set can fence it.
+         fencing? (and publish-ref? (k/conditional-write? store))
+         [head revision] (cond fencing? (branch-head store branch)
+                               publish-ref? [(branch-snapshot store branch) nil]
+                               :else [base-address nil])
+         initial {:pointer head :files (if head (snapshot-files store head) {})}
          live (MMapDirectory/open (->path (str cache "/" branch)))
          ;; ONE atom holding BOTH halves, and that is a correctness requirement
          ;; rather than tidiness. As two atoms, `listAll` claimed the pointer with
@@ -807,6 +877,17 @@
          ;; manifest, derive a new one, put it in the store and only then
          ;; install it — three steps that interleave and lose one of two edits.
          lock (Object.)
+         ;; THE FENCE. The manifest revision the next flip's pointer write is
+         ;; conditional on: read with the branch at open, then replaced by the
+         ;; revision each flip produces. NEVER taken from `listAll`, which adopts
+         ;; whatever the store's pointer says — adopting its revision as well
+         ;; would let a writer that picked up another writer's commit overwrite
+         ;; it. Nil for a manifest written before konserve stamped revisions, so
+         ;; that branch's first flip is unconditional and every one after fenced.
+         expected (atom revision)
+         ;; The refusal, once a flip has been refused. Every later sync and flip
+         ;; throws it: nothing this Directory derives from here on is the branch's.
+         fenced (atom nil)
          ;; Our own closed flag. `FilterDirectory` delegates `ensureOpen` to the
          ;; live directory, which is right for anything that touches it — but
          ;; `listAll`, `deleteFile`, `syncMetaData` and `fileLength` all reach
@@ -828,6 +909,44 @@
                         (when-let [t @guard-token]
                           (guard/done! store-id t)
                           (reset! guard-token nil)))
+         ;; Fence this Directory with `moved` and throw it. The guard is released
+         ;; first: what this sequence uploaded can never be published, so it is
+         ;; garbage like any abandoned commit, and holding the guard until close
+         ;; would stall every collection on this store id in the meantime.
+         fence! (fn [moved]
+                  (reset! fenced moved)
+                  (close-guard!)
+                  (throw moved))
+         ;; The pointer write. Conditional when fencing, and the revision it
+         ;; produces is the one the next flip expects.
+         publish! (fn [address]
+                    (if-not fencing?
+                      (k/assoc store (manifest-key branch) address {:sync? true})
+                      (let [write (fn [r]
+                                    (k/assoc store (manifest-key branch) address
+                                             (cond-> {:sync? true :with-revision? true}
+                                               (some? r) (assoc :expected-revision r))))
+                            mismatch? #(= :konserve/revision-mismatch (:type (ex-data %)))
+                            [_ produced]
+                            (try
+                              (write @expected)
+                              (catch clojure.lang.ExceptionInfo e
+                                (cond
+                                  (not (mismatch? e)) (throw e)
+                                  ;; DELETED, NOT MOVED. A live writer's next
+                                  ;; commit has always recreated a branch
+                                  ;; `delete-branch!` dropped under it, and that
+                                  ;; stays. Create-only, so a branch someone else
+                                  ;; recreated in the meantime still fences this
+                                  ;; writer.
+                                  (= k/absent (:actual (ex-data e)))
+                                  (try (write k/absent)
+                                       (catch clojure.lang.ExceptionInfo e2
+                                         (if (mismatch? e2)
+                                           (fence! (branch-moved branch e2))
+                                           (throw e2))))
+                                  :else (fence! (branch-moved branch e)))))]
+                        (reset! expected produced))))
          ;; THE COMMIT POINT. Everything else edits memory; this is the only
          ;; thing that moves the branch, and Lucene calls it exactly where a
          ;; commit becomes durable — `SegmentInfos.finishCommit` renames
@@ -847,6 +966,10 @@
                    ;; after the commit, so the shrink stayed in memory and closing
                    ;; the writer published nothing.
                    (when @dirty
+                     ;; A fenced Directory writes nothing, not even the snapshot.
+                     (when-let [moved @fenced]
+                       (close-guard!)
+                       (throw moved))
                      ;; UNDER THE GUARD. This is a values-then-pointer
                      ;; sequence — snapshot first, branch pointer second — and it
                      ;; has to be covered like any other. It used to be covered
@@ -887,7 +1010,7 @@
                        ;; root; Scriptum must not introduce another mutable
                        ;; publication point underneath that transaction.
                        (when publish-ref?
-                         (k/assoc store (manifest-key branch) address {:sync? true}))
+                         (publish! address))
                        (swap! state assoc :pointer address)
                        (reset! dirty false)
                        ;; Consumed: they belong to the commit just written, not
@@ -975,6 +1098,10 @@
          ;; manifest OLDER than one a commit just installed. Claiming the
          ;; pointer first means a racing poll loses the CAS and installs
          ;; nothing, rather than winning with a stale map.
+         ;;
+         ;; The pointer is adopted, its REVISION is not — see `expected`. A
+         ;; writer that picks up someone else's commit here is still fenced
+         ;; against it.
          (when (and publish-ref? (not @dirty))
            (let [before @state
                  a (branch-snapshot store branch)]
@@ -1026,6 +1153,10 @@
          ;; The guard opens here and closes at the flip, because that whole span
          ;; is one values-then-pointer sequence: a collection landing inside it
          ;; would sweep blobs the snapshot is about to name. See konserve.gc-guard.
+         ;;
+         ;; A FENCED Directory uploads nothing and opens no guard: no flip of its
+         ;; will ever name what it would upload.
+         (when-let [moved @fenced] (throw moved))
          ;; MATERIALIZE BEFORE FSYNC. `.sync` opens each name for WRITE, so a
          ;; name the manifest holds but this view has not touched is absent and
          ;; throws NoSuchFileException. IndexWriter.startCommit syncs every file
@@ -1397,9 +1528,11 @@
 
   THIS DROPS WHATEVER `branch` NAMED BEFORE. The superseded snapshot becomes
   unreachable and collectable — correct COW semantics, and the caller's business
-  to hold if they still want it. It also does not disturb a live writer on the
-  branch, because it cannot see one: reset a branch someone is writing and their
-  next commit derives from the state they held, not this one.
+  to hold if they still want it. A live writer on the branch cannot see this
+  move: on a store with conditional writes its next commit is REFUSED with
+  `:scriptum/branch-moved` and it has to be reopened (the manifest fence); on a
+  store without them, that commit derives from the state the writer held and
+  silently replaces this one.
 
   Returns the file map now at `branch`."
   [store branch address]

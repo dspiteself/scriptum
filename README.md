@@ -593,9 +593,18 @@ candidates it is handed.
 
 ### Limits worth knowing
 
-- **One writer per branch**, in one JVM. The write lock lives in the local
-  cache, so it does not span machines, and the manifest write is not yet a
-  compare-and-set. Writers on *different* branches are safe by construction.
+- **One writer per branch.** The write lock lives in the local cache, so it
+  does not span machines; the manifest write is what does. On a store with
+  conditional writes (`konserve.core/conditional-write-domain`: memory
+  `:process`, filestore `:machine`, an object store such as konserve-gcs
+  `:global`), each commit's pointer write is conditional on the revision the
+  writer last saw, so a second writer's commit is refused with
+  `:scriptum/branch-moved` (`scriptum.konserve/branch-moved?`) instead of
+  silently replacing the first's. Reopen the branch to continue. On a store
+  without them, keep to one writer per branch in one JVM. Writers on
+  *different* branches are safe by construction.
+- **Collect from the writer's process.** The GC guard that protects in-flight
+  blobs is in-process, so a collection elsewhere cannot see them.
 - **History accumulates until you prune it.** Every commit point is retained by
   default, so the store grows with commit count regardless of live document
   count. See Retention above.

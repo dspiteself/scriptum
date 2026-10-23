@@ -25,11 +25,14 @@
         ;; would land under a second address and stop sharing. The manifest
         ;; carries no format version to detect that; the namespace is
         ;; unreleased, so no migration is provided.
-        org.replikativ/konserve {:mvn/version "0.9.375"}}
+        ;;
+        ;; 0.9.376 for conditional writes (`:expected-revision`,
+        ;; `:with-revision?`), which the manifest fence is built on.
+        org.replikativ/konserve {:mvn/version "0.9.376"}}
 
  :aliases
  {;; Sibling checkouts, for co-development across the replikativ stack.
-  ;; Not required to build — konserve 0.9.375 carries everything this needs.
+  ;; Not required to build — konserve 0.9.376 carries everything this needs.
   :local
   {:override-deps {org.replikativ/konserve {:local/root "../konserve"}}}
 
